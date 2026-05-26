@@ -11,6 +11,10 @@ let autocomplete = null;
 let watchId = null;
 let userLatLng = null;
 let mapVisible = true;
+let activeRouteSteps = [];
+let activeStepIndex = 0;
+let lastGuidanceAt = 0;
+let activeDestinationName = '';
 
 // ── Wait for Google Maps API to load ──────────────────────────────────────────
 window.addEventListener('load', function () {
@@ -61,7 +65,7 @@ function initMap() {
     startLocationWatch();
 
     // Wire up buttons
-    document.getElementById('navigateBtn').addEventListener('click', startNavigation);
+    document.getElementById('navigateBtn').addEventListener('click', () => startMapNavigation());
     document.getElementById('locateBtn').addEventListener('click', centerOnUser);
     document.getElementById('clearRouteBtn').addEventListener('click', clearRoute);
     document.getElementById('mapToggleBtn').addEventListener('click', toggleMap);
@@ -120,6 +124,8 @@ function startLocationWatch() {
             } else {
                 userMarker.setPosition(userLatLng);
             }
+
+            updateLiveGuidance();
         },
         (error) => {
             console.warn('Geolocation error:', error.message);
@@ -153,25 +159,31 @@ function clearMapError() {
 }
 
 // ── Start Navigation (Directions) ──────────────────────────────────────────────
-function startNavigation() {
+function startMapNavigation(destinationOverride = null) {
     if (!userLatLng) {
         speak('Your location is not available yet. Please wait.');
         return;
     }
 
-    const place = autocomplete.getPlace();
+    const place = autocomplete ? autocomplete.getPlace() : null;
     let destination;
 
-    if (place && place.geometry) {
+    if (destinationOverride) {
+        destination = destinationOverride;
+        activeDestinationName = destinationOverride;
+        document.getElementById('destinationInput').value = destinationOverride;
+    } else if (place && place.geometry) {
         destination = place.geometry.location;
+        activeDestinationName = place.name || document.getElementById('destinationInput').value.trim();
     } else {
         // Fallback: use raw text input
         const inputText = document.getElementById('destinationInput').value.trim();
         if (!inputText) {
-            alert('Please enter a destination.');
+            speak('Please enter or say a destination first.');
             return;
         }
         destination = inputText;
+        activeDestinationName = inputText;
     }
 
     const request = {
@@ -187,12 +199,17 @@ function startNavigation() {
 
             // Extract route summary
             const leg = result.routes[0].legs[0];
+            activeRouteSteps = leg.steps || [];
+            activeStepIndex = 0;
+            lastGuidanceAt = 0;
+
             document.getElementById('routeDistance').textContent = `Distance: ${leg.distance.text}`;
             document.getElementById('routeDuration').textContent = `Duration: ${leg.duration.text}`;
             document.getElementById('routeInfo').style.display = 'flex';
 
             // Voice announce
-            speak(`Route found. Distance: ${leg.distance.text}. Estimated time: ${leg.duration.text}.`);
+            speak(`Route to ${activeDestinationName || 'your destination'} found. Distance: ${leg.distance.text}. Estimated time: ${leg.duration.text}.`);
+            setTimeout(() => speakCurrentStep('First direction'), 1800);
 
         } else if (status === 'REQUEST_DENIED') {
             showMapError(
@@ -224,6 +241,74 @@ function clearRoute() {
     directionsRenderer.setDirections({ routes: [] });
     document.getElementById('routeInfo').style.display = 'none';
     document.getElementById('destinationInput').value = '';
+    activeRouteSteps = [];
+    activeStepIndex = 0;
+    activeDestinationName = '';
+    lastGuidanceAt = 0;
+}
+
+function stripInstruction(html) {
+    const temp = document.createElement('div');
+    temp.innerHTML = html || '';
+    return temp.textContent || temp.innerText || '';
+}
+
+function getDistanceMeters(fromLatLng, toLatLng) {
+    if (!fromLatLng || !toLatLng) return Infinity;
+
+    const lat1 = fromLatLng.lat() * Math.PI / 180;
+    const lat2 = toLatLng.lat() * Math.PI / 180;
+    const dLat = lat2 - lat1;
+    const dLng = (toLatLng.lng() - fromLatLng.lng()) * Math.PI / 180;
+    const a = Math.sin(dLat / 2) ** 2 +
+        Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+    return 6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function speakCurrentStep(prefix = 'Next direction') {
+    if (!activeRouteSteps.length || activeStepIndex >= activeRouteSteps.length) {
+        speak('No active route directions are available.');
+        return;
+    }
+
+    const step = activeRouteSteps[activeStepIndex];
+    const instruction = stripInstruction(step.instructions);
+    const distance = step.distance ? step.distance.text : '';
+    speak(`${prefix}. In ${distance}, ${instruction}.`);
+    lastGuidanceAt = Date.now();
+}
+
+function updateLiveGuidance() {
+    if (!activeRouteSteps.length || !userLatLng || activeStepIndex >= activeRouteSteps.length) {
+        return;
+    }
+
+    const step = activeRouteSteps[activeStepIndex];
+    const distanceToStepEnd = getDistanceMeters(userLatLng, step.end_location);
+    const now = Date.now();
+
+    if (distanceToStepEnd < 35 && activeStepIndex < activeRouteSteps.length - 1) {
+        activeStepIndex += 1;
+        speakCurrentStep('Now');
+        return;
+    }
+
+    if (now - lastGuidanceAt > 30000) {
+        speakCurrentStep('Continue');
+    }
+}
+
+function repeatMapGuidance() {
+    speakCurrentStep('Current direction');
+}
+
+function speakMapLocation() {
+    const coords = document.getElementById('mapCoords').textContent;
+    if (userLatLng) {
+        speak(`Your current location is latitude ${userLatLng.lat().toFixed(5)}, longitude ${userLatLng.lng().toFixed(5)}.`);
+    } else {
+        speak(`Location is not available yet. ${coords}`);
+    }
 }
 
 // ── Toggle Map Panel Visibility ────────────────────────────────────────────────
@@ -245,6 +330,13 @@ function speak(text) {
         speechSynthesis.speak(utterance);
     }
 }
+
+window.guideXMaps = {
+    navigateTo: startMapNavigation,
+    repeatGuidance: repeatMapGuidance,
+    whereAmI: speakMapLocation,
+    clearRoute: clearRoute,
+};
 
 // ── Dark Map Theme ─────────────────────────────────────────────────────────────
 function darkMapStyle() {

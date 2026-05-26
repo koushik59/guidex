@@ -46,6 +46,17 @@ A web-based AI navigation assistant that helps blind and visually impaired peopl
 
 ### Running the Web Application
 
+Optional Smart Look setup:
+
+Smart Look uses Gemini image understanding for richer scene guidance. Create a Gemini API key in Google AI Studio, then set it before starting the app:
+
+```powershell
+$env:GEMINI_API_KEY="your_api_key_here"
+python web_app.py
+```
+
+Without this key, GuideX still runs with YOLO, OCR, Maps, and typed Mickey commands. Smart Look will simply tell you the key is missing.
+
 1. **Start the Flask server**:
    ```bash
    python web_app.py
