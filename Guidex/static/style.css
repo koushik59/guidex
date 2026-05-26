@@ -190,6 +190,65 @@ body {
     color: var(--violet);
 }
 
+.nav-btn-voice.listening {
+    background: rgba(52,211,153,0.08);
+    border-color: rgba(52,211,153,0.28);
+    color: var(--emerald);
+}
+
+.mickey-command {
+    display: flex;
+    gap: 6px;
+    padding: 6px 0;
+}
+
+.mickey-command input {
+    min-width: 0;
+    flex: 1;
+    padding: 9px 10px;
+    font-family: var(--font);
+    font-size: 0.82rem;
+    font-weight: 500;
+    background: var(--bg-card);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    outline: none;
+}
+
+.mickey-command input:focus {
+    border-color: var(--violet);
+    box-shadow: 0 0 0 3px rgba(167,139,250,0.12);
+}
+
+.mickey-command button {
+    padding: 9px 10px;
+    font-family: var(--font);
+    font-size: 0.78rem;
+    font-weight: 800;
+    background: rgba(167,139,250,0.15);
+    color: var(--violet);
+    border: 1px solid rgba(167,139,250,0.22);
+    border-radius: var(--r-sm);
+    cursor: pointer;
+}
+
+.mickey-command button:hover {
+    background: rgba(167,139,250,0.22);
+}
+
+.mickey-status {
+    padding: 7px 9px;
+    margin-bottom: 6px;
+    color: var(--amber);
+    background: rgba(251,191,36,0.08);
+    border: 1px solid rgba(251,191,36,0.16);
+    border-radius: var(--r-sm);
+    font-size: 0.78rem;
+    font-weight: 600;
+    line-height: 1.35;
+}
+
 .nav-btn-sos .nav-btn-icon {
     background: rgba(251,113,133,0.12);
 }

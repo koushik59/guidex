@@ -13,6 +13,9 @@ import os
 import atexit
 import signal
 import easyocr
+import json
+import urllib.error
+import urllib.request
 
 # Get the directory where this script is located
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -32,6 +35,15 @@ print(f"[DEBUG] index.html exists: {os.path.exists(os.path.join(TEMPLATE_DIR, 'i
 
 app = Flask(__name__, template_folder=TEMPLATE_DIR, static_folder=STATIC_DIR)
 CORS(app)
+
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
+DETECTION_WIDTH = 416
+DETECTION_INTERVAL = 0.18
+STREAM_FPS = 24
+JPEG_QUALITY = 70
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
 # ------------------ Setup ------------------
 # Expanded object detection including furniture and obstacles
@@ -54,9 +66,24 @@ SMALL_OBJECTS = ["person", "bicycle", "potted plant", "tv", "laptop", "sink",
                  "umbrella", "backpack", "handbag", "suitcase", "traffic light", "book", "cell phone"]  # Close range alerts
 
 model = YOLO("yolov8n.pt")
-engine = pyttsx3.init()
-engine.setProperty("rate", 160)
-engine.setProperty("volume", 0.9)
+
+class SilentSpeechEngine:
+    def say(self, message):
+        print(f"[TTS disabled] {message}")
+
+    def runAndWait(self):
+        return None
+
+    def stop(self):
+        return None
+
+try:
+    engine = pyttsx3.init()
+    engine.setProperty("rate", 160)
+    engine.setProperty("volume", 0.9)
+except Exception as e:
+    print(f"[WARNING] Local pyttsx3 speech disabled: {e}")
+    engine = SilentSpeechEngine()
 
 # Initialize EasyOCR
 print("Initializing EasyOCR (this may take a moment to download models on first run)...")
@@ -65,11 +92,17 @@ print("EasyOCR initialized.")
 
 # Global state
 alert_queue = queue.Queue()
+audio_alert_queue = queue.Queue()
 camera = None
 is_running = False
 latest_detections = []
 latest_frame = None
+latest_annotated_frame = None
 latest_frame_lock = threading.Lock()
+camera_thread = None
+detection_thread = None
+camera_stop_event = threading.Event()
+detection_stop_event = threading.Event()
 
 # Alert / environment configuration
 alert_mode = "english"  # or "sound" (used by frontend for persistence only)
@@ -198,10 +231,103 @@ def compute_priority(level, object_category, speed_mps, label=""):
 
     return level_factor * type_factor * speed_factor * env_factor
 
+def queue_alert(message):
+    """Send alerts to both browser clients and the local TTS worker."""
+    alert_queue.put(message)
+    audio_alert_queue.put(message)
+
+def get_latest_camera_frame():
+    """Return a copy of the latest raw camera frame."""
+    with latest_frame_lock:
+        if latest_frame is not None:
+            return latest_frame.copy()
+    return None
+
+def encode_frame_for_vision(frame, max_width=768):
+    """Encode a frame as a compact base64 JPEG for VLM requests."""
+    height, width = frame.shape[:2]
+    if width > max_width:
+        scale = max_width / width
+        frame = cv2.resize(frame, (max_width, int(height * scale)))
+
+    ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+    if not ok:
+        return None
+    return base64.b64encode(buffer.tobytes()).decode("ascii")
+
+def call_gemini_vision(frame, user_prompt=""):
+    """Ask Gemini to describe the latest scene for blind navigation."""
+    if not GEMINI_API_KEY:
+        return None, "Gemini API key is not set. Add GEMINI_API_KEY before using Smart Look."
+
+    image_base64 = encode_frame_for_vision(frame)
+    if not image_base64:
+        return None, "Could not prepare the camera image for Gemini."
+
+    detections_context = latest_detections[:8] if latest_detections else []
+    prompt = (
+        "You are Mickey, an assistive vision guide for a blind person. "
+        "Analyze the camera image and give concise, practical guidance. "
+        "Mention immediate hazards first, then useful navigation cues, then any readable signs or text. "
+        "Use short spoken sentences. Do not overclaim. If uncertain, say so. "
+        "Do not replace the user's cane, guide dog, or human judgment.\n\n"
+        f"User question: {user_prompt or 'What is around me and what should I be careful about?'}\n"
+        f"Fast detector context: {json.dumps(detections_context)}"
+    )
+
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {
+                    "mime_type": "image/jpeg",
+                    "data": image_base64,
+                }},
+            ],
+        }],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 220,
+        },
+    }
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    request_data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=request_data,
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMINI_API_KEY,
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        print(f"[Gemini] HTTP error {e.code}: {body}")
+        return None, f"Gemini request failed with HTTP {e.code}."
+    except Exception as e:
+        print(f"[Gemini] Request error: {e}")
+        return None, "Gemini request failed. Check internet connection and API key."
+
+    try:
+        parts = result["candidates"][0]["content"]["parts"]
+        text = " ".join(part.get("text", "") for part in parts).strip()
+        if text:
+            return text, None
+    except Exception:
+        pass
+
+    return None, "Gemini did not return a scene description."
+
 
 def process_frame(frame):
     """Process a single frame and return detection results"""
-    results = model(frame, verbose=False)
+    results = model(frame, imgsz=DETECTION_WIDTH, verbose=False)
     frame_height, frame_width, _ = frame.shape
     
     detections = []
@@ -321,12 +447,148 @@ def process_frame(frame):
                 else:  # small_object and furniture / hazards
                     alert_message = f"{label} very close on your {direction}. Please stop."
 
-                alert_queue.put(alert_message)
+                queue_alert(alert_message)
                 last_alert_times[category] = current_time
 
     global latest_detections
     latest_detections = detections
     return detections
+
+def draw_detections(frame, detections):
+    """Draw current detections on a frame for the live preview."""
+    for det in detections:
+        x1, y1, x2, y2 = det["bbox"]
+        level = det["level"]
+        color = (0, 0, 255) if level == "HIGH" else (0, 255, 255) if level == "MEDIUM" else (0, 255, 0)
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(
+            frame,
+            f"{det['label']} | {det['level']} | {det['direction']}",
+            (x1, max(20, y1 - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            color,
+            2,
+        )
+    return frame
+
+def open_camera():
+    """Open a camera with low-latency settings."""
+    global camera
+
+    print("[DEBUG] Attempting to open camera...")
+    for index in [0, 1, 2, 700]:
+        try:
+            candidate = cv2.VideoCapture(index, cv2.CAP_DSHOW) if os.name == 'nt' else cv2.VideoCapture(index)
+            candidate.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+            candidate.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+            candidate.set(cv2.CAP_PROP_FPS, STREAM_FPS)
+            candidate.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+            if candidate.isOpened():
+                ret, _ = candidate.read()
+                if ret:
+                    camera = candidate
+                    print(f"[SUCCESS] Camera opened on index {index}")
+                    return True
+                print(f"[WARNING] Camera opened on index {index} but failed to read frame.")
+            candidate.release()
+        except Exception as e:
+            print(f"[ERROR] Failed to open camera index {index}: {e}")
+
+    camera = None
+    return False
+
+def camera_capture_worker():
+    """Continuously capture fresh frames so streaming never waits for YOLO."""
+    global camera, latest_frame, latest_annotated_frame
+
+    while not camera_stop_event.is_set():
+        if camera is None or not camera.isOpened():
+            if not open_camera():
+                print("[ERROR] Could not open any camera. Retrying in 2s...")
+                time.sleep(2)
+                continue
+
+        ret, frame = camera.read()
+        if not ret:
+            print("[WARNING] Failed to read frame from camera. Releasing and retrying...")
+            try:
+                if camera:
+                    camera.release()
+            except Exception:
+                pass
+            camera = None
+            time.sleep(0.2)
+            continue
+
+        with latest_frame_lock:
+            latest_frame = frame.copy()
+            if latest_annotated_frame is None:
+                latest_annotated_frame = frame.copy()
+
+        time.sleep(1 / STREAM_FPS)
+
+def detection_worker():
+    """Run detection in the background at a controlled rate."""
+    global latest_annotated_frame
+
+    while not detection_stop_event.is_set():
+        frame_to_process = None
+        with latest_frame_lock:
+            if latest_frame is not None:
+                frame_to_process = latest_frame.copy()
+
+        if frame_to_process is None:
+            time.sleep(0.05)
+            continue
+
+        if is_running:
+            height, width = frame_to_process.shape[:2]
+            scale = 1.0
+            if width > DETECTION_WIDTH:
+                scale = DETECTION_WIDTH / width
+                resized = cv2.resize(frame_to_process, (DETECTION_WIDTH, int(height * scale)))
+            else:
+                resized = frame_to_process
+
+            detections = process_frame(resized)
+            if scale != 1.0:
+                for det in detections:
+                    det["bbox"] = [int(coord / scale) for coord in det["bbox"]]
+
+            annotated = draw_detections(frame_to_process, detections)
+        else:
+            annotated = frame_to_process
+            cv2.putText(
+                annotated,
+                "Ready - Press Start to begin detection",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (100, 100, 100),
+                2,
+            )
+
+        with latest_frame_lock:
+            latest_annotated_frame = annotated
+
+        time.sleep(DETECTION_INTERVAL)
+
+def ensure_background_workers():
+    """Start camera and detection workers once."""
+    global camera_thread, detection_thread
+
+    if camera_thread is None or not camera_thread.is_alive():
+        camera_stop_event.clear()
+        camera_thread = threading.Thread(target=camera_capture_worker, daemon=True)
+        camera_thread.start()
+
+    if detection_thread is None or not detection_thread.is_alive():
+        detection_stop_event.clear()
+        detection_thread = threading.Thread(target=detection_worker, daemon=True)
+        detection_thread.start()
 
 def generate_frames():
     """
@@ -337,93 +599,28 @@ def generate_frames():
     - When `is_running` is False, we still capture and send frames (without processing),
       so the camera feed is always visible.
     """
-    global camera, is_running
+    global latest_annotated_frame
 
+    ensure_background_workers()
     while True:
-        # Lazily (re)open camera when needed
-        if camera is None or not camera.isOpened():
-            print("[DEBUG] Attempting to open camera...")
-            opened = False
-            # Try multiple indices and backends
-            for index in [0, 1, 2, 700]: # 700 is often used for OBS/Virtual cameras
-                try:
-                    if os.name == 'nt': # Windows specific backend
-                        camera = cv2.VideoCapture(index, cv2.CAP_DSHOW)
-                    else:
-                        camera = cv2.VideoCapture(index)
-                    
-                    if camera.isOpened():
-                        # Test read
-                        ret, test_frame = camera.read()
-                        if ret:
-                            print(f"[SUCCESS] Camera opened on index {index}")
-                            camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                            opened = True
-                            break
-                        else:
-                            print(f"[WARNING] Camera opened on index {index} but failed to read frame.")
-                            camera.release()
-                except Exception as e:
-                    print(f"[ERROR] Failed to open camera index {index}: {e}")
-            
-            if not opened:
-                print("[ERROR] Could not open any camera. Retrying in 2s...")
-                camera = None
-                time.sleep(2)
-                continue
-
-        ret, frame = camera.read()
-        if not ret:
-            print("[WARNING] Failed to read frame from camera. Releasing and retrying...")
-            try:
-                if camera:
-                    camera.release()
-            except:
-                pass
-            camera = None
-            time.sleep(0.5)
-            continue
-            
-        global latest_frame
         with latest_frame_lock:
-            latest_frame = frame.copy()
+            frame = latest_annotated_frame.copy() if latest_annotated_frame is not None else None
 
-        # Process frame only if detection is active
-        if is_running:
-            detections = process_frame(frame)
-
-            # Draw detections on frame (visual aid for sighted helpers)
-            for det in detections:
-                x1, y1, x2, y2 = det["bbox"]
-                level = det["level"]
-                color = (0, 0, 255) if level == "HIGH" else (0, 255, 255) if level == "MEDIUM" else (0, 255, 0)
-
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(
-                    frame,
-                    f"{det['label']} | {det['level']} | {det['direction']}",
-                    (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    color,
-                    2,
-                )
-        else:
-            # When not running, show a simple "Ready" overlay
+        if frame is None:
+            frame = np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
             cv2.putText(
                 frame,
-                "Ready - Press Start to begin detection",
+                "Opening camera...",
                 (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (100, 100, 100),
+                0.8,
+                (180, 180, 180),
                 2,
             )
-
-        # Always encode and yield frame to keep stream alive
-        ret, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            
+        ret, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
         if not ret:
+            time.sleep(0.02)
             continue
 
         frame_bytes = buffer.tobytes()
@@ -431,12 +628,13 @@ def generate_frames():
             b"--frame\r\n"
             b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
         )
+        time.sleep(1 / STREAM_FPS)
 
 def audio_worker():
     """Background worker for text-to-speech"""
     while True:
         try:
-            message = alert_queue.get(timeout=1)
+            message = audio_alert_queue.get(timeout=1)
             if message:
                 engine.say(message)
                 engine.runAndWait()
@@ -536,6 +734,7 @@ def sos():
 def start_detection():
     """Start object detection"""
     global is_running
+    ensure_background_workers()
     is_running = True
     return jsonify({"status": "started"})
 
@@ -632,10 +831,107 @@ def read_text():
         print(f"OCR Error: {e}")
         return jsonify({"text": ""})
 
+@app.route('/mickey_vision', methods=['POST'])
+def mickey_vision():
+    """Use Gemini/VLM to understand the current camera frame."""
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        prompt = str(data.get("prompt", "")).strip()
+    except Exception:
+        prompt = ""
+
+    frame = get_latest_camera_frame()
+    if frame is None:
+        return jsonify({
+            "description": "",
+            "error": "Camera is not ready yet. Start the camera feed and try again.",
+        }), 503
+
+    description, error = call_gemini_vision(frame, prompt)
+    if error:
+        return jsonify({"description": "", "error": error}), 503
+
+    return jsonify({"description": description, "error": None})
+
+@app.route('/mickey', methods=['POST'])
+def mickey_assistant():
+    """Small personal assistant brain for voice commands."""
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        message = str(data.get("message", "")).strip().lower()
+    except Exception:
+        message = ""
+
+    if not message:
+        return jsonify({
+            "reply": "Hi, I am Mickey. Ask me to navigate somewhere, use smart look, read text, start detection, stop detection, repeat directions, or call SOS.",
+            "action": None,
+        })
+
+    destination = None
+    navigation_phrases = [
+        "navigate to", "take me to", "go to", "directions to", "route to", "guide me to"
+    ]
+    for phrase in navigation_phrases:
+        if phrase in message:
+            destination = message.split(phrase, 1)[1].strip(" .")
+            break
+
+    if destination:
+        return jsonify({
+            "reply": f"Finding a walking route to {destination}.",
+            "action": "navigate",
+            "destination": destination,
+        })
+
+    if any(phrase in message for phrase in ["repeat direction", "repeat directions", "next direction", "where do i go", "what is next"]):
+        return jsonify({"reply": "Repeating your current direction.", "action": "repeat_navigation"})
+
+    if any(phrase in message for phrase in ["where am i", "my location", "current location"]):
+        return jsonify({"reply": "Checking your current location.", "action": "location"})
+
+    if "clear" in message and ("route" in message or "navigation" in message or "directions" in message):
+        return jsonify({"reply": "Clearing the current route.", "action": "clear_route"})
+
+    if "start" in message and ("detection" in message or "detect" in message or "camera" in message):
+        return jsonify({"reply": "Starting obstacle detection now.", "action": "start"})
+
+    if "stop" in message and ("detection" in message or "detect" in message or "camera" in message):
+        return jsonify({"reply": "Stopping obstacle detection now.", "action": "stop"})
+
+    if any(phrase in message for phrase in ["smart look", "look carefully", "can i cross", "is it safe", "guide me through", "what is around me"]):
+        return jsonify({
+            "reply": "Using Smart Look for a deeper scene check.",
+            "action": "vision",
+            "prompt": message,
+        })
+
+    if any(word in message for word in ["front", "scene", "around", "describe", "see"]):
+        return jsonify({"reply": "Let me describe what is in front of you.", "action": "vision", "prompt": message})
+
+    if any(word in message for word in ["read", "text", "written", "paper", "document", "board"]):
+        return jsonify({"reply": "I will scan the camera view and read any text I can find.", "action": "read"})
+
+    if "indoor" in message:
+        return jsonify({"reply": "Switching to indoor mode.", "action": "indoor"})
+
+    if "outdoor" in message:
+        return jsonify({"reply": "Switching to outdoor mode.", "action": "outdoor"})
+
+    if any(word in message for word in ["emergency", "sos", "help", "call"]):
+        return jsonify({"reply": "Activating SOS.", "action": "sos"})
+
+    return jsonify({
+        "reply": "I am Mickey. I can guide you to a place, repeat walking directions, use Smart Look to understand the camera view, read text, change indoor or outdoor mode, and trigger SOS.",
+        "action": None,
+    })
+
 # ------------------ Cleanup on exit ------------------
 def cleanup():
     """Release camera and TTS engine when the application exits."""
     global camera, engine
+    camera_stop_event.set()
+    detection_stop_event.set()
     print("[CLEANUP] Shutting down — releasing camera...")
     try:
         if camera is not None and camera.isOpened():
@@ -647,7 +943,10 @@ def cleanup():
         engine.stop()
     except Exception:
         pass
-    cv2.destroyAllWindows()
+    try:
+        cv2.destroyAllWindows()
+    except Exception as e:
+        print(f"[CLEANUP] OpenCV window cleanup skipped: {e}")
     print("[CLEANUP] Done.")
 
 # Register cleanup for normal exit

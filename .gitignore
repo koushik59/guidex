@@ -1,5 +1,6 @@
 .venv/
 venv/
-VisionPath-AI-Navigation/venv/
+Guidex/venv/
 __pycache__/
 *.pyc
+*.log

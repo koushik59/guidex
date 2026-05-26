@@ -59,8 +59,22 @@
                 <div class="nav-section-label">Quick Actions</div>
                 <button id="voiceBtn" class="nav-btn nav-btn-voice" aria-label="Voice Assistant">
                     <span class="nav-btn-icon">🎤</span>
-                    <span>Voice Command</span>
+                    <span>Ask Mickey</span>
                 </button>
+                <button id="mickeyLiveBtn" class="nav-btn nav-btn-voice" aria-label="Toggle Mickey live assistant">
+                    <span class="nav-btn-icon">●</span>
+                    <span>Mickey Live</span>
+                </button>
+                <button id="smartLookBtn" class="nav-btn nav-btn-voice" aria-label="Use Mickey Smart Look">
+                    <span class="nav-btn-icon">👁</span>
+                    <span>Smart Look</span>
+                </button>
+                <div class="mickey-command">
+                    <input id="mickeyTextInput" type="text" placeholder="Type Mickey command..."
+                        aria-label="Type a Mickey command" />
+                    <button id="mickeySendBtn" type="button" aria-label="Send Mickey command">Ask</button>
+                </div>
+                <div id="mickeyStatus" class="mickey-status" aria-live="polite">Mickey is ready.</div>
                 <button id="sosBtn" class="nav-btn nav-btn-sos" aria-label="Emergency SOS, hold for 2 seconds">
                     <span class="nav-btn-icon">🆘</span>
                     <span>SOS (Hold 2s)</span>
@@ -126,7 +140,7 @@
                     <div class="stat-icon stat-icon-purple">🧠</div>
                     <div class="stat-info">
                         <span class="stat-value">5</span>
-                        <span class="stat-label">AI Features</span>
+                        <span class="stat-label">Mickey Assistant</span>
                     </div>
                 </div>
                 <div class="stat-card">
@@ -199,13 +213,13 @@
                     <div class="features-strip">
                         <span class="chip chip-blue">🧠 Intent</span>
                         <span class="chip chip-green">🚦 Signals</span>
-                        <span class="chip chip-purple">🎤 Voice</span>
+                        <span class="chip chip-purple">Mickey</span>
                         <span class="chip chip-orange">⚠️ Hazards</span>
                         <span class="chip chip-pink">📍 Scene</span>
                     </div>
 
                     <div class="tip-box">
-                        💡 Say <em>"What's in front of me?"</em> after clicking Voice Command
+                        Say <em>"Mickey, what's in front of me?"</em> or <em>"Mickey, read this"</em>.
                     </div>
                 </div>
             </div>
