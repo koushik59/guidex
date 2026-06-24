@@ -197,6 +197,15 @@ body {
 }
 
 
+.nav-btn-read .nav-btn-icon {
+    background: rgba(251, 191, 36, 0.15);
+}
+.nav-btn-read:hover:not(:disabled) {
+    background: rgba(251, 191, 36, 0.06);
+    border-color: rgba(251, 191, 36, 0.25);
+    color: var(--amber);
+}
+
 .nav-btn-sos .nav-btn-icon {
     background: rgba(251,113,133,0.12);
 }

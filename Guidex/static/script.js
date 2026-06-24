@@ -4,6 +4,8 @@
 let isRunning = false;
 let alertCheckInterval = null;
 let statusCheckInterval = null;
+let scanCheckInterval = null;
+let lastScanTimestamp = 0;
 
 // Initialize Web Speech API for audio feedback
 const synth = window.speechSynthesis;
@@ -38,7 +40,7 @@ const detectionsDiv = document.getElementById('detections');
 const videoStream = document.getElementById('videoStream');
 const alertModeSelect = document.getElementById('alertMode');
 const environmentModeSelect = document.getElementById('environmentMode');
-const voiceBtn = document.getElementById('voiceBtn');
+const readTextBtn = document.getElementById('readTextBtn');
 
 // SOS long-press handling
 let sosPressTimer = null;
@@ -181,14 +183,32 @@ stopBtn.addEventListener('click', stopNavigation);
 alertModeSelect.addEventListener('change', handleAlertModeChange);
 environmentModeSelect.addEventListener('change', handleEnvironmentChange);
 
+if (readTextBtn) {
+    readTextBtn.addEventListener('click', () => {
+        vibrate([50]);
+        readTextFromCamera();
+    });
+}
+
 // Keyboard accessibility
 document.addEventListener('keydown', (e) => {
+    // Prevent shortcut activation when typing in input/select fields
+    if (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'SELECT') {
+        return;
+    }
+
+    const key = e.key.toLowerCase();
+
     if (e.key === ' ' || e.key === 'Enter') {
         if (document.activeElement === startBtn && !isRunning) {
             startNavigation();
         } else if (document.activeElement === stopBtn && isRunning) {
             stopNavigation();
         }
+    } else if (key === 't') {
+        e.preventDefault();
+        vibrate([50]);
+        readTextFromCamera();
     }
 });
 
@@ -405,6 +425,65 @@ function stopStatusCheck() {
     }
 }
 
+function clearDetectionEmptyState() {
+    const emptyState = detectionsDiv.querySelector('.empty-state');
+    const noDetections = detectionsDiv.querySelector('.no-detections');
+    if (emptyState) {
+        emptyState.remove();
+    }
+    if (noDetections) {
+        noDetections.remove();
+    }
+}
+
+function trimDetectionItems() {
+    const items = detectionsDiv.querySelectorAll('.detection-item');
+    if (items.length > 5) {
+        items[items.length - 1].remove();
+    }
+}
+
+function addDetectionItem({ label, level = 'medium', badges = [], autoRemove = true }) {
+    clearDetectionEmptyState();
+
+    const detectionItem = document.createElement('div');
+    detectionItem.className = `detection-item ${level}`;
+    detectionItem.setAttribute('role', 'alert');
+    detectionItem.setAttribute('aria-live', 'assertive');
+
+    const labelWrap = document.createElement('div');
+    const labelEl = document.createElement('span');
+    labelEl.className = 'detection-label';
+    labelEl.textContent = label;
+    labelWrap.appendChild(labelEl);
+
+    const infoEl = document.createElement('div');
+    infoEl.className = 'detection-info';
+    badges.forEach((badge) => {
+        const badgeEl = document.createElement('span');
+        badgeEl.className = `detection-badge ${badge.className || ''}`.trim();
+        badgeEl.textContent = badge.text;
+        infoEl.appendChild(badgeEl);
+    });
+
+    detectionItem.appendChild(labelWrap);
+    detectionItem.appendChild(infoEl);
+    detectionsDiv.insertBefore(detectionItem, detectionsDiv.firstChild);
+    trimDetectionItems();
+
+    if (autoRemove) {
+        setTimeout(() => {
+            if (detectionItem.parentNode) {
+                detectionItem.remove();
+
+                if (detectionsDiv.children.length === 0) {
+                    detectionsDiv.innerHTML = '<p class="no-detections">No objects detected.</p>';
+                }
+            }
+        }, 10000);
+    }
+}
+
 function updateDetectionsDisplay(alertMessage) {
     // Parse alert message to extract information
     // Format: "{label} very close on your {direction}. Please stop."
@@ -428,49 +507,49 @@ function updateDetectionsDisplay(alertMessage) {
     }
 
     if (label && direction) {
-        // Create detection item
-        const detectionItem = document.createElement('div');
-        detectionItem.className = `detection-item ${level}`;
-        detectionItem.setAttribute('role', 'alert');
-        detectionItem.setAttribute('aria-live', 'assertive');
-
-        detectionItem.innerHTML = `
-            <div>
-                <span class="detection-label">${label}</span>
-            </div>
-            <div class="detection-info">
-                <span class="detection-badge badge-level ${level}">${level.toUpperCase()} DANGER</span>
-                <span class="detection-badge badge-direction">${direction.toUpperCase()}</span>
-            </div>
-        `;
-
-        // Remove "no detections" message if present
-        const noDetections = detectionsDiv.querySelector('.no-detections');
-        if (noDetections) {
-            noDetections.remove();
-        }
-
-        // Add new detection at the top
-        detectionsDiv.insertBefore(detectionItem, detectionsDiv.firstChild);
-
-        // Keep only last 5 detections
-        const items = detectionsDiv.querySelectorAll('.detection-item');
-        if (items.length > 5) {
-            items[items.length - 1].remove();
-        }
-
-        // Auto-remove after 10 seconds
-        setTimeout(() => {
-            if (detectionItem.parentNode) {
-                detectionItem.remove();
-
-                // Show "no detections" if list is empty
-                if (detectionsDiv.children.length === 0) {
-                    detectionsDiv.innerHTML = '<p class="no-detections">No objects detected.</p>';
-                }
-            }
-        }, 10000);
+        addDetectionItem({
+            label,
+            level,
+            badges: [
+                { text: `${level.toUpperCase()} DANGER`, className: `badge-level ${level}` },
+                { text: direction.toUpperCase(), className: 'badge-direction' }
+            ]
+        });
     }
+}
+
+function addScannedTextDetection(text) {
+    addDetectionItem({
+        label: text.trim(),
+        level: 'medium',
+        badges: [
+            { text: 'SCANNED TEXT', className: 'badge-level medium' },
+            { text: 'OCR', className: 'badge-direction' }
+        ],
+        autoRemove: false
+    });
+}
+
+function startScanCheck() {
+    if (scanCheckInterval) {
+        return;
+    }
+
+    scanCheckInterval = setInterval(async () => {
+        try {
+            const response = await fetch('/latest_scan');
+            const data = await response.json();
+            const timestamp = Number(data.timestamp || 0);
+            const text = (data.text || '').trim();
+
+            if (text && timestamp > lastScanTimestamp) {
+                lastScanTimestamp = timestamp;
+                addScannedTextDetection(text);
+            }
+        } catch (error) {
+            console.error('Error checking latest scan:', error);
+        }
+    }, 1000);
 }
 
 // Handle video stream errors
@@ -493,6 +572,7 @@ videoStream.addEventListener('loadstart', () => {
 
 // Initialize UI
 updateUI();
+startScanCheck();
 
 // Load current settings on page load
 Promise.all([
@@ -516,33 +596,15 @@ Promise.all([
     console.error('Error loading initial settings:', error);
 });
 
-
-
-
-
-async function getSceneDescription() {
-    try {
-        const response = await fetch('/scene_description');
-        const data = await response.json();
-        if (data.description) {
-            speak(data.description);
-        }
-    } catch (error) {
-        console.error('Error getting scene description:', error);
-        speak('Error retrieving scene description.');
-    }
-}
-
-
-
 async function readTextFromCamera() {
     speak("Scanning for text. This may take a moment.");
     try {
-        const response = await fetch('/read_text');
+        const response = await fetch('/scan');
         const data = await response.json();
 
         if (data.text && data.text.trim() !== '') {
-            speak("I read: " + data.text);
+            lastScanTimestamp = Number(data.timestamp || Date.now() / 1000);
+            addScannedTextDetection(data.text);
         } else {
             speak("I couldn't detect any text.");
         }

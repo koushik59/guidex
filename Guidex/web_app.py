@@ -99,6 +99,9 @@ latest_detections = []
 latest_frame = None
 latest_annotated_frame = None
 latest_frame_lock = threading.Lock()
+latest_scan_text = ""
+latest_scan_timestamp = 0.0
+latest_scan_lock = threading.Lock()
 camera_thread = None
 detection_thread = None
 camera_stop_event = threading.Event()
@@ -561,6 +564,7 @@ def generate_frames():
 # ==================================================================
 def run_scan_and_speak():
     """Grab the current frame, OCR it, and speak the detected text. Returns the text."""
+    global latest_scan_text, latest_scan_timestamp
     ensure_background_workers()
 
     # Wait briefly in case the camera just started.
@@ -593,6 +597,9 @@ def run_scan_and_speak():
 
         if final_text:
             print(f"[SCAN] Detected text: {final_text}")
+            with latest_scan_lock:
+                latest_scan_text = final_text
+                latest_scan_timestamp = time.time()
             speak(final_text)
         else:
             print("[SCAN] No clear text detected.")
@@ -820,7 +827,18 @@ def scan_route():
     """Trigger OCR + speech from the UI (button). Same action as the 'scan' voice command."""
     stop_playback()
     text = run_scan_and_speak()
-    return jsonify({"text": text})
+    with latest_scan_lock:
+        timestamp = latest_scan_timestamp if text else 0.0
+    return jsonify({"text": text, "timestamp": timestamp})
+
+@app.route('/latest_scan', methods=['GET'])
+def latest_scan():
+    """Return the latest OCR text detected by button or voice scan."""
+    with latest_scan_lock:
+        return jsonify({
+            "text": latest_scan_text,
+            "timestamp": latest_scan_timestamp
+        })
 
 @app.route('/stop_speech', methods=['POST', 'GET'])
 def stop_speech_route():

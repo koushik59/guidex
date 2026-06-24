@@ -58,6 +58,11 @@
 
                 <div class="nav-section-label">Quick Actions</div>
 
+                <button id="readTextBtn" class="nav-btn nav-btn-read" aria-label="Read text from camera">
+                    <span class="nav-btn-icon">📖</span>
+                    <span>Read Text</span>
+                </button>
+
                 <button id="sosBtn" class="nav-btn nav-btn-sos" aria-label="Emergency SOS, hold for 2 seconds">
                     <span class="nav-btn-icon">🆘</span>
                     <span>SOS (Hold 2s)</span>
@@ -90,6 +95,11 @@
                         <option value="indoor">🏠 Indoor</option>
                         <option value="auto">⚡ Auto Detect</option>
                     </select>
+                </div>
+
+                <div class="sidebar-tip-box" aria-hidden="true" style="margin: 12px 10px; padding: 12px; background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: var(--r-md); font-size: 0.78rem; line-height: 1.4; color: var(--text-2);">
+                    <strong style="color: var(--accent2); display: block; margin-bottom: 4px;">Keyboard Shortcuts:</strong>
+                    • Press <kbd style="background: rgba(255,255,255,0.1); padding: 1px 4px; border-radius: 3px; font-family: monospace;">T</kbd> to read/scan text.
                 </div>
             </nav>
 
@@ -191,7 +201,7 @@
                         <span class="chip chip-blue">🧠 Intent</span>
                         <span class="chip chip-green">🚦 Signals</span>
                         <span class="chip chip-orange">⚠️ Hazards</span>
-                        <span class="chip chip-pink">📍 Scene</span>
+                        <span class="chip chip-pink">📖 Text</span>
                     </div>
 
 
