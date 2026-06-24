@@ -1,0 +1,16 @@
+settings_version: 0.0.4
+datasets_dir: /home/niat/Guidex_1/datasets
+weights_dir: /home/niat/Guidex_1/weights
+runs_dir: /home/niat/Guidex_1/runs
+uuid: a7b71f71d31558d60515e980a82e062e24aad5b0bb27e77440cfb81175493b52
+sync: true
+api_key: ''
+clearml: true
+comet: true
+dvc: true
+hub: true
+mlflow: true
+neptune: true
+raytune: true
+tensorboard: true
+wandb: true
