@@ -1076,11 +1076,22 @@ def latest_scan():
 def recognize_face_route():
     """Trigger facial recognition + speech from the UI (button).
     Same action as the 'who' voice command."""
+    if not FACE_RECOGNITION_AVAILABLE:
+        message = "Facial recognition is not available."
+        speak(message)
+        return jsonify({
+            "available": False,
+            "faces": [],
+            "message": message,
+            "timestamp": 0.0
+        }), 503
+
     stop_playback()
     results = run_face_recognition_and_speak()
     with latest_face_lock:
         timestamp = latest_face_timestamp
     return jsonify({
+        "available": True,
         "faces": results,
         "message": _build_face_message(results),
         "timestamp": timestamp

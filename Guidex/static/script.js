@@ -6,6 +6,7 @@ let alertCheckInterval = null;
 let statusCheckInterval = null;
 let scanCheckInterval = null;
 let lastScanTimestamp = 0;
+let faceRecognitionBusy = false;
 
 // Initialize Web Speech API for audio feedback
 const synth = window.speechSynthesis;
@@ -41,6 +42,7 @@ const videoStream = document.getElementById('videoStream');
 const alertModeSelect = document.getElementById('alertMode');
 const environmentModeSelect = document.getElementById('environmentMode');
 const readTextBtn = document.getElementById('readTextBtn');
+const faceBtn = document.getElementById('faceBtn');
 
 // SOS long-press handling
 let sosPressTimer = null;
@@ -190,6 +192,13 @@ if (readTextBtn) {
     });
 }
 
+if (faceBtn) {
+    faceBtn.addEventListener('click', () => {
+        vibrate([50]);
+        recognizeFaceFromCamera();
+    });
+}
+
 // Keyboard accessibility
 document.addEventListener('keydown', (e) => {
     // Prevent shortcut activation when typing in input/select fields
@@ -209,6 +218,10 @@ document.addEventListener('keydown', (e) => {
         e.preventDefault();
         vibrate([50]);
         readTextFromCamera();
+    } else if (key === 'f') {
+        e.preventDefault();
+        vibrate([50]);
+        recognizeFaceFromCamera();
     }
 });
 
@@ -530,6 +543,27 @@ function addScannedTextDetection(text) {
     });
 }
 
+function addFaceDetection(message, faces = []) {
+    const recognizedNames = faces
+        .filter((face) => face.name && face.name !== 'unknown')
+        .map((face) => face.name);
+    const unknownCount = faces.filter((face) => face.name === 'unknown').length;
+    const badges = [{ text: 'FACE', className: 'badge-level face' }];
+
+    if (recognizedNames.length > 0) {
+        badges.push({ text: recognizedNames.join(', ').toUpperCase(), className: 'badge-direction' });
+    } else if (unknownCount > 0) {
+        badges.push({ text: 'UNKNOWN', className: 'badge-direction' });
+    }
+
+    addDetectionItem({
+        label: message,
+        level: 'face',
+        badges,
+        autoRemove: false
+    });
+}
+
 function startScanCheck() {
     if (scanCheckInterval) {
         return;
@@ -611,5 +645,39 @@ async function readTextFromCamera() {
     } catch (error) {
         console.error('Error reading text:', error);
         speak('Error trying to read text.');
+    }
+}
+
+async function recognizeFaceFromCamera() {
+    if (faceRecognitionBusy) {
+        return;
+    }
+
+    faceRecognitionBusy = true;
+    if (faceBtn) {
+        faceBtn.disabled = true;
+        faceBtn.classList.add('loading');
+    }
+
+    speak("Checking for faces. This may take a moment.");
+    try {
+        const response = await fetch('/recognize_face');
+        const data = await response.json();
+        const message = data.message || "I couldn't check for faces.";
+
+        addFaceDetection(message, data.faces || []);
+
+        if (data.available === false) {
+            speak('Facial recognition is not available on this device.');
+        }
+    } catch (error) {
+        console.error('Error recognizing face:', error);
+        speak('Error trying to recognize faces.');
+    } finally {
+        faceRecognitionBusy = false;
+        if (faceBtn) {
+            faceBtn.disabled = false;
+            faceBtn.classList.remove('loading');
+        }
     }
 }
