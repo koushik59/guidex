@@ -36,6 +36,16 @@ except Exception as e:
     _pyttsx3_engine = None
     print(f"[TTS] pyttsx3 unavailable (will use espeak-ng): {e}")
 
+# face_recognition (dlib-based) powers the new facial-recognition feature. It is
+# OPTIONAL: if it is not installed, every other feature keeps working normally.
+try:
+    import face_recognition
+    FACE_RECOGNITION_AVAILABLE = True
+except Exception as e:
+    face_recognition = None
+    FACE_RECOGNITION_AVAILABLE = False
+    print(f"[FACE] face_recognition unavailable -> facial recognition disabled: {e}")
+
 # Get the directory where this script is located
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_DIR = os.path.join(BASE_DIR, 'templates')
@@ -118,6 +128,20 @@ environment_mode = "outdoor"
 COOLDOWN_MAP = {"large_vehicle": 2.0, "medium_vehicle": 3.0, "small_object": 5.0}
 last_alert_times = {"large_vehicle": 0.0, "medium_vehicle": 0.0, "small_object": 0.0}
 object_track_state = {}
+
+# ------------------ Facial recognition state ------------------
+# Faces are recognized ON DEMAND (voice command "who" / the /recognize_face route),
+# exactly like the OCR scan. Nothing here runs inside the per-frame detection loop,
+# so the existing object-detection performance is unaffected.
+KNOWN_FACES_DIR = os.path.join(BASE_DIR, "known_faces")
+FACE_MATCH_TOLERANCE = 0.5          # lower = stricter. face_recognition default is 0.6
+FACE_DETECTION_MODEL = "hog"        # "hog" (CPU friendly) or "cnn" (needs CUDA-built dlib)
+known_face_encodings = []
+known_face_names = []
+face_lock = threading.Lock()        # face_recognition calls are not thread-safe
+latest_face_result = []             # last recognition result (list of {name, direction})
+latest_face_timestamp = 0.0
+latest_face_lock = threading.Lock()
 
 # ==================================================================
 #                       LOCAL TEXT-TO-SPEECH
@@ -611,9 +635,211 @@ def run_scan_and_speak():
         return ""
 
 # ==================================================================
+#               FACIAL RECOGNITION  (recognize -> speak)
+#  Mirrors the OCR scan pattern: runs ON DEMAND only (voice "who" /
+#  the /recognize_face route), never inside the detection loop.
+# ==================================================================
+def load_known_faces():
+    """Load and encode every image under known_faces/ at startup.
+
+    Two folder layouts are supported:
+        known_faces/John.jpg                 (one photo per person)
+        known_faces/John/anything.jpg        (multiple photos per person)
+    The person's name is taken from the file name (without extension) or the
+    sub-folder name.
+    """
+    global known_face_encodings, known_face_names
+    if not FACE_RECOGNITION_AVAILABLE:
+        return
+    os.makedirs(KNOWN_FACES_DIR, exist_ok=True)
+
+    encodings, names = [], []
+    valid_ext = (".jpg", ".jpeg", ".png", ".bmp")
+
+    for entry in sorted(os.listdir(KNOWN_FACES_DIR)):
+        path = os.path.join(KNOWN_FACES_DIR, entry)
+        if os.path.isdir(path):
+            person = entry
+            image_paths = [os.path.join(path, f) for f in sorted(os.listdir(path))
+                           if f.lower().endswith(valid_ext)]
+        elif entry.lower().endswith(valid_ext):
+            person = os.path.splitext(entry)[0]
+            image_paths = [path]
+        else:
+            continue
+
+        for img_path in image_paths:
+            try:
+                image = face_recognition.load_image_file(img_path)
+                face_encs = face_recognition.face_encodings(image)
+                if face_encs:
+                    encodings.append(face_encs[0])
+                    names.append(person)
+                    print(f"[FACE] Loaded '{person}' from {os.path.basename(img_path)}")
+                else:
+                    print(f"[FACE] No face found in {img_path}, skipping.")
+            except Exception as e:
+                print(f"[FACE] Error loading {img_path}: {e}")
+
+    with face_lock:
+        known_face_encodings = encodings
+        known_face_names = names
+    print(f"[FACE] {len(encodings)} encoding(s) loaded for {len(set(names))} person(s).")
+
+def _build_face_message(results):
+    """Turn a recognition result list into a natural spoken sentence."""
+    if not results:
+        return "I don't see anyone in front of you."
+
+    named = [r for r in results if r["name"] != "unknown"]
+    unknown_count = sum(1 for r in results if r["name"] == "unknown")
+
+    parts = []
+    if named:
+        phrases = [f"{r['name']} on your {r['direction']}" for r in named]
+        if len(phrases) == 1:
+            parts.append(f"I can see {phrases[0]}.")
+        else:
+            parts.append("I can see " + ", ".join(phrases[:-1]) + f", and {phrases[-1]}.")
+
+    if unknown_count == 1:
+        parts.append("There is also a person I don't recognize." if named
+                     else "There is a person in front of you that I don't recognize.")
+    elif unknown_count > 1:
+        parts.append(f"There are also {unknown_count} people I don't recognize." if named
+                     else f"There are {unknown_count} people I don't recognize.")
+    return " ".join(parts)
+
+def run_face_recognition_and_speak():
+    """Grab the current frame, recognize faces, and speak who is present.
+
+    Returns a list of {"name", "direction"} dicts (also stored for /latest_face).
+    """
+    global latest_face_result, latest_face_timestamp
+    if not FACE_RECOGNITION_AVAILABLE:
+        speak("Facial recognition is not available.")
+        return []
+    ensure_background_workers()
+
+    frame = None
+    for _ in range(20):
+        with latest_frame_lock:
+            if latest_frame is not None:
+                frame = latest_frame.copy()
+        if frame is not None:
+            break
+        time.sleep(0.1)
+
+    if frame is None:
+        print("[FACE] No camera frame available yet.")
+        speak("Camera is not ready yet.")
+        return []
+
+    print("[FACE] Running face recognition on current frame...")
+    try:
+        # Downscale for speed; face_recognition wants RGB, OpenCV gives BGR.
+        h, w = frame.shape[:2]
+        if w > 640:
+            scale = 640.0 / w
+            small = cv2.resize(frame, (640, int(h * scale)))
+        else:
+            small = frame
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        small_w = small.shape[1]
+
+        with face_lock:
+            locations = face_recognition.face_locations(rgb, model=FACE_DETECTION_MODEL)
+            encodings = face_recognition.face_encodings(rgb, locations)
+            known_encs = list(known_face_encodings)
+            known_nms = list(known_face_names)
+
+        results = []
+        for (top, right, bottom, left), enc in zip(locations, encodings):
+            name = "unknown"
+            if known_encs:
+                distances = face_recognition.face_distance(known_encs, enc)
+                best = int(np.argmin(distances))
+                if distances[best] <= FACE_MATCH_TOLERANCE:
+                    name = known_nms[best]
+            results.append({"name": name, "direction": get_direction(left, right, small_w)})
+
+        with latest_face_lock:
+            latest_face_result = results
+            latest_face_timestamp = time.time()
+
+        message = _build_face_message(results)
+        print(f"[FACE] {message}")
+        speak(message)
+        return results
+    except Exception as e:
+        print(f"[FACE] Recognition error: {e}")
+        speak("Sorry, I could not check for faces.")
+        return []
+
+def register_face_from_frame(name):
+    """Capture the current frame and enroll the single visible face under `name`.
+
+    Saves the photo into known_faces/ and adds the encoding to memory immediately,
+    so the person can be recognized straight away without a restart.
+    Returns (success: bool, message: str).
+    """
+    if not FACE_RECOGNITION_AVAILABLE:
+        return False, "Facial recognition is not available."
+    ensure_background_workers()
+
+    frame = None
+    for _ in range(20):
+        with latest_frame_lock:
+            if latest_frame is not None:
+                frame = latest_frame.copy()
+        if frame is not None:
+            break
+        time.sleep(0.1)
+
+    if frame is None:
+        return False, "Camera is not ready yet."
+
+    try:
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        with face_lock:
+            locations = face_recognition.face_locations(rgb, model=FACE_DETECTION_MODEL)
+
+        if not locations:
+            speak("I could not find a face to register.")
+            return False, "No face detected in the current frame."
+        if len(locations) > 1:
+            speak("Please make sure only one person is in view.")
+            return False, "More than one face detected. Only one person should be in view."
+
+        with face_lock:
+            enc = face_recognition.face_encodings(rgb, locations)[0]
+
+        os.makedirs(KNOWN_FACES_DIR, exist_ok=True)
+        safe_name = "".join(c for c in name if c.isalnum() or c in (" ", "_", "-")).strip()
+        safe_name = safe_name.replace(" ", "_") or "person"
+        save_path = os.path.join(KNOWN_FACES_DIR, f"{safe_name}.jpg")
+        counter = 1
+        while os.path.exists(save_path):   # don't overwrite an existing enrollment
+            save_path = os.path.join(KNOWN_FACES_DIR, f"{safe_name}_{counter}.jpg")
+            counter += 1
+        cv2.imwrite(save_path, frame)
+
+        with face_lock:
+            known_face_encodings.append(enc)
+            known_face_names.append(name)
+
+        speak(f"I have registered {name}.")
+        print(f"[FACE] Registered '{name}' -> {save_path}")
+        return True, f"Registered {name}."
+    except Exception as e:
+        print(f"[FACE] Registration error: {e}")
+        return False, f"Registration failed: {e}"
+
+# ==================================================================
 #                 VOICE COMMAND LISTENER (Vosk, offline)
-#   say "scan" / "read"  -> OCR + speak the text
-#   say "stop"           -> stop the speech
+#   say "scan" / "read"     -> OCR + speak the text
+#   say "who" / "recognize" -> facial recognition + speak who is present
+#   say "stop"              -> stop the speech
 # ==================================================================
 def find_working_microphone():
     devices = sd.query_devices()
@@ -674,7 +900,8 @@ def voice_command_thread():
         return
 
     with stream:
-        print("[VOICE] --- MICROPHONE LIVE. Say 'scan' to read text, 'stop' to stop. ---")
+        print("[VOICE] --- MICROPHONE LIVE. Say 'scan' to read text, "
+              "'who' to recognize faces, 'stop' to stop. ---")
         speak("Voice system ready.")
         while not voice_stop_event.is_set():
             try:
@@ -690,6 +917,10 @@ def voice_command_thread():
                         stop_playback()      # cut off anything already speaking
                         speak("Scanning.")
                         run_scan_and_speak()
+                    elif "who" in command or "recognize" in command or "face" in command:
+                        stop_playback()      # cut off anything already speaking
+                        speak("Looking.")
+                        run_face_recognition_and_speak()
             except queue.Empty:
                 continue
             except Exception as e:
@@ -840,6 +1071,56 @@ def latest_scan():
             "timestamp": latest_scan_timestamp
         })
 
+# ------------------ Facial recognition routes ------------------
+@app.route('/recognize_face', methods=['POST', 'GET'])
+def recognize_face_route():
+    """Trigger facial recognition + speech from the UI (button).
+    Same action as the 'who' voice command."""
+    stop_playback()
+    results = run_face_recognition_and_speak()
+    with latest_face_lock:
+        timestamp = latest_face_timestamp
+    return jsonify({
+        "faces": results,
+        "message": _build_face_message(results),
+        "timestamp": timestamp
+    })
+
+@app.route('/register_face', methods=['POST'])
+def register_face_route():
+    """Enroll the face currently in view under a given name.
+    Body: {"name": "John"}"""
+    data = request.get_json(force=True, silent=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"status": "error", "message": "A name is required."}), 400
+    ok, message = register_face_from_frame(name)
+    return jsonify({"status": "ok" if ok else "error", "message": message})
+
+@app.route('/list_faces', methods=['GET'])
+def list_faces_route():
+    """List all currently enrolled people."""
+    with face_lock:
+        names = sorted(set(known_face_names))
+    return jsonify({"faces": names, "available": FACE_RECOGNITION_AVAILABLE})
+
+@app.route('/reload_faces', methods=['POST', 'GET'])
+def reload_faces_route():
+    """Re-scan the known_faces/ folder (e.g. after adding photos manually)."""
+    load_known_faces()
+    with face_lock:
+        names = sorted(set(known_face_names))
+    return jsonify({"status": "ok", "faces": names})
+
+@app.route('/latest_face', methods=['GET'])
+def latest_face_route():
+    """Return the most recent facial recognition result."""
+    with latest_face_lock:
+        return jsonify({
+            "faces": latest_face_result,
+            "timestamp": latest_face_timestamp
+        })
+
 @app.route('/stop_speech', methods=['POST', 'GET'])
 def stop_speech_route():
     """Stop any ongoing speech. Call this from the Navigation button."""
@@ -889,8 +1170,14 @@ signal.signal(signal.SIGTERM, signal_handler)
 
 # ------------------ Start background workers at import ------------------
 # Started here (not lazily) so you can immediately see in the terminal whether
-# voice/TTS are working.
+# voice/TTS/faces are working.
 threading.Thread(target=tts_worker, daemon=True).start()
+
+# Load enrolled faces once at startup (safe no-op if the library is missing).
+if FACE_RECOGNITION_AVAILABLE:
+    load_known_faces()
+else:
+    print("[FACE] Facial recognition not started (face_recognition unavailable).")
 
 if VOICE_AUDIO_AVAILABLE:
     voice_stop_event.clear()
