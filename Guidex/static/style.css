@@ -613,6 +613,10 @@ body {
     border-left-color: var(--amber);
     background: rgba(251,191,36,0.05);
 }
+.detection-item.text {
+    border-left-color: var(--pink);
+    background: rgba(244,114,182,0.05);
+}
 .detection-item.face {
     border-left-color: var(--emerald);
     background: rgba(52,211,153,0.05);
@@ -627,6 +631,10 @@ body {
     font-weight: 600;
     font-size: 0.92rem;
     text-transform: capitalize;
+    overflow-wrap: anywhere;
+}
+.detection-item.text .detection-label {
+    text-transform: none;
 }
 .detection-info { display: flex; gap: 6px; flex-wrap: wrap; }
 
@@ -640,6 +648,7 @@ body {
 .badge-level       { background: var(--accent2); color: #0a0e1a; }
 .badge-level.high   { background: var(--rose); color: #0a0e1a; }
 .badge-level.medium { background: var(--amber); color: #0a0e1a; }
+.badge-level.text   { background: var(--pink); color: #0a0e1a; }
 .badge-level.face   { background: var(--emerald); color: #0a0e1a; }
 .badge-direction    { background: var(--emerald); color: #0a0e1a; }
 

@@ -5,7 +5,9 @@ let isRunning = false;
 let alertCheckInterval = null;
 let statusCheckInterval = null;
 let scanCheckInterval = null;
+let faceCheckInterval = null;
 let lastScanTimestamp = 0;
+let lastFaceTimestamp = 0;
 let faceRecognitionBusy = false;
 
 // Initialize Web Speech API for audio feedback
@@ -450,9 +452,10 @@ function clearDetectionEmptyState() {
 }
 
 function trimDetectionItems() {
-    const items = detectionsDiv.querySelectorAll('.detection-item');
-    if (items.length > 5) {
+    let items = detectionsDiv.querySelectorAll('.detection-item');
+    while (items.length > 5) {
         items[items.length - 1].remove();
+        items = detectionsDiv.querySelectorAll('.detection-item');
     }
 }
 
@@ -531,15 +534,30 @@ function updateDetectionsDisplay(alertMessage) {
     }
 }
 
-function addScannedTextDetection(text) {
+function addScannedTextDetection(text, direction = 'center') {
     addDetectionItem({
         label: text.trim(),
-        level: 'medium',
+        level: 'text',
         badges: [
-            { text: 'SCANNED TEXT', className: 'badge-level medium' },
-            { text: 'OCR', className: 'badge-direction' }
+            { text: 'SCANNED TEXT', className: 'badge-level text' },
+            { text: direction.toUpperCase(), className: 'badge-direction' }
         ],
         autoRemove: false
+    });
+}
+
+function addScannedTextDetections(text, results = []) {
+    const scanResults = Array.isArray(results)
+        ? results.filter((item) => item && item.text && item.text.trim() !== '')
+        : [];
+
+    if (scanResults.length === 0) {
+        addScannedTextDetection(text, 'center');
+        return;
+    }
+
+    [...scanResults].reverse().forEach((item) => {
+        addScannedTextDetection(item.text, item.direction || 'center');
     });
 }
 
@@ -578,10 +596,32 @@ function startScanCheck() {
 
             if (text && timestamp > lastScanTimestamp) {
                 lastScanTimestamp = timestamp;
-                addScannedTextDetection(text);
+                addScannedTextDetections(text, data.results || []);
             }
         } catch (error) {
             console.error('Error checking latest scan:', error);
+        }
+    }, 1000);
+}
+
+function startFaceCheck() {
+    if (faceCheckInterval) {
+        return;
+    }
+
+    faceCheckInterval = setInterval(async () => {
+        try {
+            const response = await fetch('/latest_face');
+            const data = await response.json();
+            const timestamp = Number(data.timestamp || 0);
+            const message = (data.message || '').trim();
+
+            if (message && timestamp > lastFaceTimestamp) {
+                lastFaceTimestamp = timestamp;
+                addFaceDetection(message, data.faces || []);
+            }
+        } catch (error) {
+            console.error('Error checking latest face:', error);
         }
     }, 1000);
 }
@@ -607,6 +647,7 @@ videoStream.addEventListener('loadstart', () => {
 // Initialize UI
 updateUI();
 startScanCheck();
+startFaceCheck();
 
 // Load current settings on page load
 Promise.all([
@@ -638,7 +679,7 @@ async function readTextFromCamera() {
 
         if (data.text && data.text.trim() !== '') {
             lastScanTimestamp = Number(data.timestamp || Date.now() / 1000);
-            addScannedTextDetection(data.text);
+            addScannedTextDetections(data.text, data.results || []);
         } else {
             speak("I couldn't detect any text.");
         }
@@ -665,6 +706,7 @@ async function recognizeFaceFromCamera() {
         const data = await response.json();
         const message = data.message || "I couldn't check for faces.";
 
+        lastFaceTimestamp = Number(data.timestamp || Date.now() / 1000);
         addFaceDetection(message, data.faces || []);
 
         if (data.available === false) {

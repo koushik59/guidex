@@ -99,10 +99,27 @@ model = YOLO("yolov8n.pt")
 print("Initializing EasyOCR (first run may download models)...")
 reader = easyocr.Reader(['en'])
 ocr_lock = threading.Lock()
-print("EasyOCR initialized.")
+
+# ---- OCR speed settings ----
+# Smaller frames + a smaller internal canvas mean far less work per scan.
+OCR_MAX_WIDTH = 640      # downscale frames to this width before OCR
+OCR_CANVAS_SIZE = 960    # EasyOCR's internal max dimension (default is 2560)
+OCR_MAG_RATIO = 1.0      # do not upscale the image
+
+# Warm up the OCR pipeline ONCE here, at startup, with a throwaway image.
+# All the heavy one-time initialization happens now instead of on the user's
+# first real "scan", so live scans return quickly.
+try:
+    _warm = np.full((200, 600, 3), 255, dtype=np.uint8)
+    cv2.putText(_warm, "warm up 123", (20, 130),
+                cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 0, 0), 3)
+    reader.readtext(_warm, canvas_size=OCR_CANVAS_SIZE, mag_ratio=OCR_MAG_RATIO)
+    print("EasyOCR initialized and warmed up.")
+except Exception as _warm_err:
+    print(f"EasyOCR initialized (warmup skipped: {_warm_err}).")
 
 # ------------------ Global state ------------------
-alert_queue = queue.Queue()        # consumed by the browser via /get_alert
+alert_queue = queue.Queue()  # consumed by the browser via /get_alert
 camera = None
 is_running = False
 latest_detections = []
@@ -110,6 +127,7 @@ latest_frame = None
 latest_annotated_frame = None
 latest_frame_lock = threading.Lock()
 latest_scan_text = ""
+latest_scan_results = []
 latest_scan_timestamp = 0.0
 latest_scan_lock = threading.Lock()
 camera_thread = None
@@ -134,25 +152,26 @@ object_track_state = {}
 # exactly like the OCR scan. Nothing here runs inside the per-frame detection loop,
 # so the existing object-detection performance is unaffected.
 KNOWN_FACES_DIR = os.path.join(BASE_DIR, "known_faces")
-FACE_MATCH_TOLERANCE = 0.5          # lower = stricter. face_recognition default is 0.6
-FACE_DETECTION_MODEL = "hog"        # "hog" (CPU friendly) or "cnn" (needs CUDA-built dlib)
+FACE_MATCH_TOLERANCE = 0.5     # lower = stricter. face_recognition default is 0.6
+FACE_DETECTION_MODEL = "hog"   # "hog" (CPU friendly) or "cnn" (needs CUDA-built dlib)
 known_face_encodings = []
 known_face_names = []
-face_lock = threading.Lock()        # face_recognition calls are not thread-safe
-latest_face_result = []             # last recognition result (list of {name, direction})
+face_lock = threading.Lock()   # face_recognition calls are not thread-safe
+latest_face_result = []        # last recognition result (list of {name, direction})
 latest_face_timestamp = 0.0
 latest_face_lock = threading.Lock()
 
 # ==================================================================
-#                       LOCAL TEXT-TO-SPEECH
-#  espeak-ng -> wav, then play through pw-play / paplay / aplay.
-#  This is the path that actually produces sound on Jetson/Linux.
+# LOCAL TEXT-TO-SPEECH
+# espeak-ng -> wav, then play through pw-play / paplay / aplay.
+# This is the path that actually produces sound on Jetson/Linux.
 # ==================================================================
 speech_queue = queue.Queue()
 audio_process = None                 # currently running synth/playback subprocess
 audio_process_lock = threading.Lock()
 tts_stop_event = threading.Event()   # shuts the worker down on exit
 interrupt_event = threading.Event()  # set by stop_playback() to abort current speech
+
 
 def _run_audio_command(cmd, timeout=30):
     """Run a single audio subprocess and return True on success."""
@@ -179,6 +198,7 @@ def _run_audio_command(cmd, timeout=30):
             audio_process = None
     return rc == 0
 
+
 def _synthesize_wav(text, path):
     """Render text to a wav file using espeak-ng (or espeak)."""
     for tts_bin in ("espeak-ng", "espeak"):
@@ -187,6 +207,7 @@ def _synthesize_wav(text, path):
                 if os.path.exists(path) and os.path.getsize(path) > 0:
                     return True
     return False
+
 
 def _play_wav(path):
     """Play a wav file through whichever audio backend is available."""
@@ -206,6 +227,7 @@ def _play_wav(path):
         if interrupt_event.is_set():
             return False
     return False
+
 
 def tts_worker():
     """Background worker that speaks every message placed on speech_queue."""
@@ -247,6 +269,7 @@ def tts_worker():
         if not spoke and not interrupt_event.is_set():
             print(f"[TTS] (silent) wanted to say: {text}")
 
+
 def stop_playback():
     """Flush pending speech and kill any audio that is currently playing."""
     print("[TTS] Stop requested -> flushing speech pipeline.")
@@ -274,6 +297,7 @@ def stop_playback():
     except Exception:
         pass
 
+
 def speak(text):
     """Queue a message for local speech output."""
     if text:
@@ -285,6 +309,7 @@ def estimate_distance(box_height, frame_height):
         return 999
     return (frame_height / box_height) * 0.5
 
+
 def get_object_category(label):
     if label in LARGE_VEHICLES:
         return "large_vehicle"
@@ -293,6 +318,7 @@ def get_object_category(label):
     elif label in SMALL_OBJECTS:
         return "small_object"
     return "small_object"
+
 
 def danger_level(distance, object_category):
     if object_category == "large_vehicle":
@@ -314,6 +340,7 @@ def danger_level(distance, object_category):
             return "MEDIUM"
         return "LOW"
 
+
 def get_direction(x1, x2, frame_width):
     center_x = (x1 + x2) / 2
     if center_x < frame_width / 3:
@@ -321,6 +348,29 @@ def get_direction(x1, x2, frame_width):
     elif center_x < 2 * frame_width / 3:
         return "center"
     return "right"
+
+
+def _ocr_results_to_entries(results, frame_width):
+    """Convert EasyOCR output into display-ready text detections."""
+    entries = []
+    for bbox, text, prob in results:
+        clean_text = text.strip()
+        if prob <= 0.3 or len(clean_text) <= 1:
+            continue
+
+        try:
+            xs = [float(point[0]) for point in bbox]
+            direction = get_direction(min(xs), max(xs), frame_width)
+        except Exception:
+            direction = "center"
+
+        entries.append({
+            "text": clean_text,
+            "direction": direction,
+            "confidence": round(float(prob), 2),
+        })
+    return entries
+
 
 def compute_priority(level, object_category, speed_mps, label=""):
     level_factor = {"LOW": 1.0, "MEDIUM": 2.0, "HIGH": 3.0}.get(level, 1.0)
@@ -345,10 +395,12 @@ def compute_priority(level, object_category, speed_mps, label=""):
 
     return level_factor * type_factor * speed_factor * env_factor
 
+
 def queue_alert(message):
     """Send a detection alert to the browser AND speak it locally."""
-    alert_queue.put(message)   # browser polls this via /get_alert
-    speak(message)             # local espeak-ng output
+    alert_queue.put(message)  # browser polls this via /get_alert
+    speak(message)            # local espeak-ng output
+
 
 def process_frame(frame):
     results = model(frame, imgsz=DETECTION_WIDTH, verbose=False)
@@ -462,6 +514,7 @@ def process_frame(frame):
     latest_detections = detections
     return detections
 
+
 def draw_detections(frame, detections):
     for det in detections:
         x1, y1, x2, y2 = det["bbox"]
@@ -471,6 +524,7 @@ def draw_detections(frame, detections):
         cv2.putText(frame, f"{det['label']} | {det['level']} | {det['direction']}",
                     (x1, max(20, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
     return frame
+
 
 def open_camera():
     global camera
@@ -489,11 +543,12 @@ def open_camera():
                     print(f"[SUCCESS] Camera opened on index {index}")
                     return True
                 print(f"[WARNING] Camera opened on index {index} but failed to read frame.")
-            candidate.release()
+                candidate.release()
         except Exception as e:
             print(f"[ERROR] Failed to open camera index {index}: {e}")
     camera = None
     return False
+
 
 def camera_capture_worker():
     global camera, latest_frame, latest_annotated_frame
@@ -519,6 +574,7 @@ def camera_capture_worker():
             if latest_annotated_frame is None:
                 latest_annotated_frame = frame.copy()
         time.sleep(1 / STREAM_FPS)
+
 
 def detection_worker():
     global latest_annotated_frame
@@ -553,6 +609,7 @@ def detection_worker():
             latest_annotated_frame = annotated
         time.sleep(DETECTION_INTERVAL)
 
+
 def ensure_background_workers():
     """Start camera + detection workers once (voice/tts started at module load)."""
     global camera_thread, detection_thread
@@ -564,6 +621,7 @@ def ensure_background_workers():
         detection_stop_event.clear()
         detection_thread = threading.Thread(target=detection_worker, daemon=True)
         detection_thread.start()
+
 
 def generate_frames():
     global latest_annotated_frame
@@ -584,11 +642,11 @@ def generate_frames():
         time.sleep(1 / STREAM_FPS)
 
 # ==================================================================
-#                   OCR SCAN  (read text -> speak)
+# OCR SCAN (read text -> speak)
 # ==================================================================
 def run_scan_and_speak():
     """Grab the current frame, OCR it, and speak the detected text. Returns the text."""
-    global latest_scan_text, latest_scan_timestamp
+    global latest_scan_text, latest_scan_results, latest_scan_timestamp
     ensure_background_workers()
 
     # Wait briefly in case the camera just started.
@@ -609,20 +667,27 @@ def run_scan_and_speak():
     print("[SCAN] Running OCR on current frame...")
     try:
         h, w = frame.shape[:2]
-        if w > 800:
-            scale = 800.0 / w
-            frame = cv2.resize(frame, (800, int(h * scale)))
+        if w > OCR_MAX_WIDTH:
+            scale = OCR_MAX_WIDTH / w
+            frame = cv2.resize(frame, (OCR_MAX_WIDTH, int(h * scale)))
 
         with ocr_lock:
-            results = reader.readtext(frame)
+            results = reader.readtext(
+                frame,
+                canvas_size=OCR_CANVAS_SIZE,
+                mag_ratio=OCR_MAG_RATIO,
+                paragraph=False,
+                batch_size=4,
+            )
 
-        texts = [t.strip() for (bbox, t, prob) in results if prob > 0.3 and len(t.strip()) > 1]
-        final_text = " ".join(texts).strip()
+        scan_results = _ocr_results_to_entries(results, frame.shape[1])
+        final_text = " ".join(item["text"] for item in scan_results).strip()
 
         if final_text:
             print(f"[SCAN] Detected text: {final_text}")
             with latest_scan_lock:
                 latest_scan_text = final_text
+                latest_scan_results = scan_results
                 latest_scan_timestamp = time.time()
             speak(final_text)
         else:
@@ -635,9 +700,9 @@ def run_scan_and_speak():
         return ""
 
 # ==================================================================
-#               FACIAL RECOGNITION  (recognize -> speak)
-#  Mirrors the OCR scan pattern: runs ON DEMAND only (voice "who" /
-#  the /recognize_face route), never inside the detection loop.
+# FACIAL RECOGNITION (recognize -> speak)
+# Mirrors the OCR scan pattern: runs ON DEMAND only (voice "who" /
+# the /recognize_face route), never inside the detection loop.
 # ==================================================================
 def load_known_faces():
     """Load and encode every image under known_faces/ at startup.
@@ -686,6 +751,7 @@ def load_known_faces():
         known_face_names = names
     print(f"[FACE] {len(encodings)} encoding(s) loaded for {len(set(names))} person(s).")
 
+
 def _build_face_message(results):
     """Turn a recognition result list into a natural spoken sentence."""
     if not results:
@@ -709,6 +775,7 @@ def _build_face_message(results):
         parts.append(f"There are also {unknown_count} people I don't recognize." if named
                      else f"There are {unknown_count} people I don't recognize.")
     return " ".join(parts)
+
 
 def run_face_recognition_and_speak():
     """Grab the current frame, recognize faces, and speak who is present.
@@ -776,8 +843,9 @@ def run_face_recognition_and_speak():
         speak("Sorry, I could not check for faces.")
         return []
 
+
 def register_face_from_frame(name):
-    """Capture the current frame and enroll the single visible face under `name`.
+    """Capture the current frame and enroll the single visible face under name.
 
     Saves the photo into known_faces/ and adds the encoding to memory immediately,
     so the person can be recognized straight away without a restart.
@@ -836,13 +904,85 @@ def register_face_from_frame(name):
         return False, f"Registration failed: {e}"
 
 # ==================================================================
-#                 VOICE COMMAND LISTENER (Vosk, offline)
-#   say "scan" / "read"     -> OCR + speak the text
-#   say "who" / "recognize" -> facial recognition + speak who is present
-#   say "stop"              -> stop the speech
+# COMMAND WORKER
+# Runs scan / face jobs on their OWN thread so the voice listener never
+# blocks. Without this, a slow scan would stall the microphone loop and
+# commands would pile up. command_busy lets us ignore repeat presses while
+# a job is already running.
 # ==================================================================
+command_queue = queue.Queue()
+command_busy = threading.Event()
+command_worker_thread = None
+
+
+def command_worker():
+    print("[CMD] Command worker online.")
+    while not voice_stop_event.is_set():
+        try:
+            action = command_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        if action is None:
+            break
+        command_busy.set()
+        try:
+            if action == "scan":
+                stop_playback()
+                speak("Scanning.")
+                run_scan_and_speak()
+            elif action == "face":
+                stop_playback()
+                speak("Looking.")
+                run_face_recognition_and_speak()
+        except Exception as e:
+            print(f"[CMD] Worker error: {e}")
+        finally:
+            command_busy.clear()
+
+
+# ==================================================================
+# VOICE COMMAND LISTENER (Vosk, offline)   *** CORRECTED ***
+# say "scan" / "read"          -> OCR + speak the text
+# say "who" / "recognize"/"face"-> facial recognition + speak who is present
+# say "stop"                   -> stop the speech
+#
+# Fixes vs. the old free-form version:
+#   1. GRAMMAR restriction with a "[unk]" bucket. Vosk now only emits your
+#      command words; all other speech (background talk, its own TTS) becomes
+#      [unk] and is ignored. This is what kills "campbell"/"amy money"/etc.
+#   2. blocksize 4000 -> 1600 (lower latency).
+#   3. Empty / [unk] / low-confidence results are dropped.
+#   4. Audio captured WHILE the device is speaking is discarded, so it can't
+#      trigger itself from its own voice (feedback loop).
+#   5. recognizer is Reset() after each command for a clean next utterance.
+# ==================================================================
+
+# Words the app understands. "[unk]" MUST stay: it is the "not a command"
+# bucket that prevents background noise being forced into a real command.
+VOICE_COMMANDS = json.dumps([
+    "scan", "read", "who", "face", "recognize", "stop", "[unk]"
+])
+
+# Minimum average word confidence (0..1) for a command to count.
+# Raise toward 0.8 if you still get false triggers; lower toward 0.4 if real
+# commands are being ignored.
+VOICE_MIN_CONFIDENCE = 0.6
+
+# Hard-code a device index here (e.g. 25) if auto-pick grabs the wrong mic.
+VOICE_DEVICE_INDEX = None
+
+
 def find_working_microphone():
     devices = sd.query_devices()
+    # Print all input devices once so you can see the indices on startup.
+    print("[VOICE] Audio input devices:")
+    for idx, dev in enumerate(devices):
+        if dev["max_input_channels"] > 0:
+            print(f"        [{idx}] {dev['name']} (in:{dev['max_input_channels']})")
+
+    if VOICE_DEVICE_INDEX is not None:
+        return VOICE_DEVICE_INDEX
+
     fallback_index = sd.default.device[0]
     for idx, dev in enumerate(devices):
         if dev['max_input_channels'] > 0:
@@ -850,6 +990,7 @@ def find_working_microphone():
             if 'pipewire' in name or 'pulse' in name or 'default' in name:
                 return idx
     return fallback_index
+
 
 def voice_command_thread():
     if not VOICE_AUDIO_AVAILABLE:
@@ -878,7 +1019,9 @@ def voice_command_thread():
         print(f"[VOICE] Vosk model error: {e}")
         return
 
-    recognizer = KaldiRecognizer(vosk_model, 16000)
+    # --- THE FIX: grammar-restricted recognizer with an [unk] bucket ---
+    recognizer = KaldiRecognizer(vosk_model, 16000, VOICE_COMMANDS)
+    recognizer.SetWords(True)   # enables per-word confidence
     audio_queue = queue.Queue()
 
     try:
@@ -890,14 +1033,34 @@ def voice_command_thread():
         return
 
     def audio_callback(indata, frames, time_info, status):
+        # Drop audio captured while WE are speaking, so the device cannot
+        # trigger itself from its own TTS output (feedback loop).
+        with audio_process_lock:
+            speaking = audio_process is not None
+        if speaking:
+            return
         audio_queue.put(bytes(indata))
 
     try:
-        stream = sd.RawInputStream(samplerate=16000, blocksize=4000, dtype='int16',
+        stream = sd.RawInputStream(samplerate=16000, blocksize=1600, dtype='int16',
                                    channels=1, device=mic_index, callback=audio_callback)
     except Exception as e:
         print(f"[VOICE] Microphone stream failure: {e}")
         return
+
+    def extract_command(result_json):
+        """Return a clean command word, or '' if the audio was noise/[unk]."""
+        result = json.loads(result_json)
+        text = result.get("text", "").lower().strip()
+        text = text.replace("[unk]", "").strip()
+        if not text:
+            return ""
+        words = [w for w in result.get("result", []) if w.get("word") != "[unk]"]
+        if words:
+            avg_conf = sum(w.get("conf", 0.0) for w in words) / len(words)
+            if avg_conf < VOICE_MIN_CONFIDENCE:
+                return ""
+        return text
 
     with stream:
         print("[VOICE] --- MICROPHONE LIVE. Say 'scan' to read text, "
@@ -907,20 +1070,24 @@ def voice_command_thread():
             try:
                 data = audio_queue.get(timeout=0.5)
                 if recognizer.AcceptWaveform(data):
-                    result = json.loads(recognizer.Result())
-                    command = result.get("text", "").lower().strip()
-                    if command:
-                        print(f"[VOICE] Heard: '{command}'")
+                    command = extract_command(recognizer.Result())
+                    if not command:
+                        continue
+                    print(f"[VOICE] Command: '{command}'")
                     if "stop" in command:
+                        # Stop is immediate: drop anything queued and kill speech.
+                        with command_queue.mutex:
+                            command_queue.queue.clear()
                         stop_playback()
                     elif "read" in command or "scan" in command:
-                        stop_playback()      # cut off anything already speaking
-                        speak("Scanning.")
-                        run_scan_and_speak()
+                        # Hand off to the worker so the listener stays responsive.
+                        # Ignore repeats while a scan/face job is already running.
+                        if not command_busy.is_set():
+                            command_queue.put("scan")
                     elif "who" in command or "recognize" in command or "face" in command:
-                        stop_playback()      # cut off anything already speaking
-                        speak("Looking.")
-                        run_face_recognition_and_speak()
+                        if not command_busy.is_set():
+                            command_queue.put("face")
+                    recognizer.Reset()       # clean slate for the next command
             except queue.Empty:
                 continue
             except Exception as e:
@@ -936,9 +1103,11 @@ def index():
         return f"Template not found. Looking for: {template_path}", 500
     return render_template('index.html')
 
+
 @app.route('/video_feed')
 def video_feed():
     return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
 
 @app.route('/set_alert_mode', methods=['POST'])
 def set_alert_mode():
@@ -953,9 +1122,11 @@ def set_alert_mode():
     alert_mode = mode
     return jsonify({"mode": alert_mode})
 
+
 @app.route('/get_alert_mode', methods=['GET'])
 def get_alert_mode():
     return jsonify({"mode": alert_mode})
+
 
 @app.route('/set_environment', methods=['POST'])
 def set_environment():
@@ -970,14 +1141,17 @@ def set_environment():
     environment_mode = mode
     return jsonify({"mode": environment_mode})
 
+
 @app.route('/get_environment', methods=['GET'])
 def get_environment():
     return jsonify({"mode": environment_mode})
+
 
 @app.route('/sos', methods=['POST'])
 def sos():
     print("[SOS] Emergency assistance requested from client.")
     return jsonify({"status": "received"})
+
 
 @app.route('/start', methods=['POST'])
 def start_detection():
@@ -986,15 +1160,18 @@ def start_detection():
     is_running = True
     return jsonify({"status": "started"})
 
+
 @app.route('/stop', methods=['POST'])
 def stop_detection():
     global is_running
     is_running = False
     return jsonify({"status": "stopped"})
 
+
 @app.route('/status', methods=['GET'])
 def get_status():
     return jsonify({"running": is_running})
+
 
 @app.route('/get_alert', methods=['GET'])
 def get_alert():
@@ -1003,6 +1180,7 @@ def get_alert():
         return jsonify({"alert": message})
     except queue.Empty:
         return jsonify({"alert": None})
+
 
 @app.route('/scene_description', methods=['GET'])
 def scene_description():
@@ -1034,9 +1212,11 @@ def scene_description():
             parts.append(f"I see {', '.join(items[:-1])}, and {items[-1]} in front of you.")
     return jsonify({"description": " ".join(parts)})
 
+
 @app.route('/read_text', methods=['GET'])
 def read_text():
     """Return text from the latest frame (no speech). Kept for backward compatibility."""
+    global latest_scan_text, latest_scan_results, latest_scan_timestamp
     frame_to_process = None
     with latest_frame_lock:
         if latest_frame is not None:
@@ -1046,12 +1226,18 @@ def read_text():
     try:
         with ocr_lock:
             results = reader.readtext(frame_to_process)
-        extracted_texts = [text for (bbox, text, prob) in results if prob > 0.3]
-        final_text = " ".join(extracted_texts).strip()
-        return jsonify({"text": final_text})
+        scan_results = _ocr_results_to_entries(results, frame_to_process.shape[1])
+        final_text = " ".join(item["text"] for item in scan_results).strip()
+        if final_text:
+            with latest_scan_lock:
+                latest_scan_text = final_text
+                latest_scan_results = scan_results
+                latest_scan_timestamp = time.time()
+        return jsonify({"text": final_text, "results": scan_results})
     except Exception as e:
         print(f"OCR Error: {e}")
         return jsonify({"text": ""})
+
 
 @app.route('/scan', methods=['POST', 'GET'])
 def scan_route():
@@ -1060,7 +1246,9 @@ def scan_route():
     text = run_scan_and_speak()
     with latest_scan_lock:
         timestamp = latest_scan_timestamp if text else 0.0
-    return jsonify({"text": text, "timestamp": timestamp})
+        results = list(latest_scan_results) if text else []
+    return jsonify({"text": text, "results": results, "timestamp": timestamp})
+
 
 @app.route('/latest_scan', methods=['GET'])
 def latest_scan():
@@ -1068,6 +1256,7 @@ def latest_scan():
     with latest_scan_lock:
         return jsonify({
             "text": latest_scan_text,
+            "results": latest_scan_results,
             "timestamp": latest_scan_timestamp
         })
 
@@ -1097,6 +1286,7 @@ def recognize_face_route():
         "timestamp": timestamp
     })
 
+
 @app.route('/register_face', methods=['POST'])
 def register_face_route():
     """Enroll the face currently in view under a given name.
@@ -1108,12 +1298,14 @@ def register_face_route():
     ok, message = register_face_from_frame(name)
     return jsonify({"status": "ok" if ok else "error", "message": message})
 
+
 @app.route('/list_faces', methods=['GET'])
 def list_faces_route():
     """List all currently enrolled people."""
     with face_lock:
         names = sorted(set(known_face_names))
     return jsonify({"faces": names, "available": FACE_RECOGNITION_AVAILABLE})
+
 
 @app.route('/reload_faces', methods=['POST', 'GET'])
 def reload_faces_route():
@@ -1123,20 +1315,25 @@ def reload_faces_route():
         names = sorted(set(known_face_names))
     return jsonify({"status": "ok", "faces": names})
 
+
 @app.route('/latest_face', methods=['GET'])
 def latest_face_route():
     """Return the most recent facial recognition result."""
     with latest_face_lock:
+        faces = list(latest_face_result)
         return jsonify({
-            "faces": latest_face_result,
+            "faces": faces,
+            "message": _build_face_message(faces),
             "timestamp": latest_face_timestamp
         })
+
 
 @app.route('/stop_speech', methods=['POST', 'GET'])
 def stop_speech_route():
     """Stop any ongoing speech. Call this from the Navigation button."""
     stop_playback()
     return jsonify({"status": "stopped"})
+
 
 @app.route('/voice_status', methods=['GET'])
 def voice_status():
@@ -1169,12 +1366,15 @@ def cleanup():
         print(f"[CLEANUP] OpenCV window cleanup skipped: {e}")
     print("[CLEANUP] Done.")
 
+
 atexit.register(cleanup)
+
 
 def signal_handler(sig, frame):
     print(f"\n[SIGNAL] Received signal {sig}, cleaning up...")
     cleanup()
     os._exit(0)
+
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
@@ -1183,6 +1383,10 @@ signal.signal(signal.SIGTERM, signal_handler)
 # Started here (not lazily) so you can immediately see in the terminal whether
 # voice/TTS/faces are working.
 threading.Thread(target=tts_worker, daemon=True).start()
+
+# Worker that runs scan/face jobs off the voice thread.
+command_worker_thread = threading.Thread(target=command_worker, daemon=True)
+command_worker_thread.start()
 
 # Load enrolled faces once at startup (safe no-op if the library is missing).
 if FACE_RECOGNITION_AVAILABLE:
