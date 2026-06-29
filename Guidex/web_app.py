@@ -154,13 +154,16 @@ object_track_state = {}
 
 # ---- Navigation voice state (for "navigate → one/two/three" flow) ----
 nav_voice_state_lock = threading.Lock()
-nav_voice_state = {'mode': 'idle', 'locations': [], 'expires': 0.0}
+# 'type' is 'saved' (from SQLite) or 'search' (from Places API results)
+nav_voice_state = {'mode': 'idle', 'type': 'saved', 'items': [], 'expires': 0.0}
 pending_navigation = None           # set by voice thread, consumed by /api/pending_nav
 pending_navigation_lock = threading.Lock()
 save_location_triggered = False     # set by voice thread, consumed by /api/save_triggered
 save_location_lock = threading.Lock()
 voice_name_state = {'name': None}   # set by voice thread, consumed by /api/voice_name
 voice_name_lock = threading.Lock()
+voice_search_state = {'term': None} # set by voice thread, consumed by /api/voice_search
+voice_search_lock = threading.Lock()
 
 # ------------------ Facial recognition state ------------------
 # Faces are recognized ON DEMAND (voice command "who" / the /recognize_face route),
@@ -1003,13 +1006,37 @@ def command_worker():
 
 # Words the app understands. "[unk]" MUST stay: it is the "not a command"
 # bucket that prevents background noise being forced into a real command.
+#
+# Place-type keywords are included so the user can say the full command in
+# ONE breath — e.g. "search hotels" or "find restaurant" — without needing
+# a two-step prompt. Vosk force-fits audio to the nearest grammar word, so
+# "hospitals" → "hospital", "restaurants" → "restaurant", etc.
 VOICE_COMMANDS = json.dumps([
+    # Core commands
     "scan", "read", "who", "face", "recognize", "stop",
     "save", "navigate", "go", "list", "places", "show",
+    "search", "find", "nearby",
+    # Common place categories (enables one-shot "search hotels")
+    "hotel", "hotels", "restaurant", "restaurants", "food", "cafe",
+    "hospital", "clinic", "pharmacy", "doctor", "medical", "emergency",
+    "bank", "atm", "store", "market", "shop", "mall", "supermarket",
+    "school", "college", "university", "temple", "church", "mosque",
+    "police", "station", "bus", "park", "petrol", "gas", "fuel",
+    # Number picking
     "one", "two", "three", "four", "five",
     "six", "seven", "eight", "nine", "ten",
     "[unk]"
 ])
+
+# Place-type words recognised in the grammar above.
+# Used to detect one-shot "search <term>" commands.
+_PLACE_KEYWORDS = {
+    "hotel", "hotels", "restaurant", "restaurants", "food", "cafe",
+    "hospital", "clinic", "pharmacy", "doctor", "medical", "emergency",
+    "bank", "atm", "store", "market", "shop", "mall", "supermarket",
+    "school", "college", "university", "temple", "church", "mosque",
+    "police", "station", "bus", "park", "petrol", "gas", "fuel",
+}
 
 # Minimum average word confidence (0..1) for a command to count.
 # Raise toward 0.7 if you get false triggers; lower toward 0.35 if real
@@ -1114,39 +1141,42 @@ def voice_command_thread():
         return text
 
     with stream:
-        print("[VOICE] --- MICROPHONE LIVE. Say 'scan', 'who', 'save', 'navigate', 'go', 'list', 'stop' ---")
+        print("[VOICE] --- LIVE. Commands: scan, who, save, navigate/go, list, search/find, stop ---")
         speak("Voice system ready.")
 
-        # Name-capture mode: entered after "save" command
-        capturing_name = False
-        name_capture_timeout = 0.0
+        # capture_mode: 'none' | 'name' (after save) | 'search' (after search/find/nearby)
+        capture_mode = 'none'
+        capture_timeout = 0.0
 
         while not voice_stop_event.is_set():
             try:
                 data = audio_queue.get(timeout=0.5)
 
-                # ── Name capture mode ────────────────────────────────────────
-                if capturing_name:
-                    if time.time() > name_capture_timeout:
-                        # Timed out — cancel capture, reset overlay on frontend
-                        capturing_name = False
+                # ── Free-form capture mode (name or search term) ─────────────
+                if capture_mode != 'none':
+                    if time.time() > capture_timeout:
+                        capture_mode = 'none'
                         global save_location_triggered
                         with save_location_lock:
                             save_location_triggered = False
-                        speak("Name capture timed out. Try again.")
+                        speak("Timed out. Try again.")
                         name_recognizer.Reset()
                         recognizer.Reset()
                         continue
 
                     if name_recognizer.AcceptWaveform(data):
                         result = json.loads(name_recognizer.Result())
-                        name_text = result.get("text", "").strip()
-                        # Filter out empty / pure silence results
-                        if name_text and name_text not in ("[unk]", "the", "a"):
-                            with voice_name_lock:
-                                voice_name_state['name'] = name_text
-                            speak(f"Saving location as {name_text}.")
-                            capturing_name = False
+                        captured = result.get("text", "").strip()
+                        if captured and captured not in ("[unk]", "the", "a", ""):
+                            if capture_mode == 'name':
+                                with voice_name_lock:
+                                    voice_name_state['name'] = captured
+                                speak(f"Saving location as {captured}.")
+                            elif capture_mode == 'search':
+                                with voice_search_lock:
+                                    voice_search_state['term'] = captured
+                                speak(f"Searching for {captured} near you.")
+                            capture_mode = 'none'
                             name_recognizer.Reset()
                             recognizer.Reset()
 
@@ -1175,13 +1205,34 @@ def voice_command_thread():
                             with save_location_lock:
                                 save_location_triggered = True
                             speak("Say the name for this location.")
-                            capturing_name = True
-                            name_capture_timeout = time.time() + 12.0
-                            # Drain any stale audio before listening for the name
+                            capture_mode = 'name'
+                            capture_timeout = time.time() + 12.0
                             while not audio_queue.empty():
                                 try: audio_queue.get_nowait()
                                 except Exception: break
                             name_recognizer.Reset()
+
+                        elif "search" in command or "find" in command or "nearby" in command:
+                            # Check for one-shot: "search hotels", "find restaurant"
+                            words = command.split()
+                            inline_term = " ".join(
+                                w for w in words
+                                if w in _PLACE_KEYWORDS
+                            ).strip()
+                            if inline_term:
+                                # Full command in one breath — no prompt needed
+                                with voice_search_lock:
+                                    voice_search_state['term'] = inline_term
+                                speak(f"Searching for {inline_term} near you.")
+                            else:
+                                # Just "search" alone → ask what they want
+                                speak("What are you looking for?")
+                                capture_mode = 'search'
+                                capture_timeout = time.time() + 12.0
+                                while not audio_queue.empty():
+                                    try: audio_queue.get_nowait()
+                                    except Exception: break
+                                name_recognizer.Reset()
 
                         elif "list" in command or "places" in command or "show" in command:
                             locs = get_all_locations()
@@ -1198,7 +1249,8 @@ def voice_command_thread():
                             else:
                                 with nav_voice_state_lock:
                                     nav_voice_state['mode'] = 'picking'
-                                    nav_voice_state['locations'] = locs[:10]
+                                    nav_voice_state['type'] = 'saved'
+                                    nav_voice_state['items'] = locs[:10]
                                     nav_voice_state['expires'] = time.time() + 20
                                 parts = [f"{i + 1} for {l['name']}" for i, l in enumerate(locs[:5])]
                                 speak("Say the number of your destination. " + ", ".join(parts) + ".")
@@ -1207,8 +1259,8 @@ def voice_command_thread():
                                  ["one", "two", "three", "four", "five",
                                   "six", "seven", "eight", "nine", "ten"]):
                             with nav_voice_state_lock:
-                                mode = nav_voice_state['mode']
-                                locs = list(nav_voice_state['locations'])
+                                mode    = nav_voice_state['mode']
+                                items   = list(nav_voice_state['items'])
                                 expires = nav_voice_state['expires']
                             if mode == 'picking' and time.time() < expires:
                                 num_map = {"one": 1, "two": 2, "three": 3, "four": 4,
@@ -1219,8 +1271,8 @@ def voice_command_thread():
                                     if word in command:
                                         chosen = num
                                         break
-                                if chosen and 1 <= chosen <= len(locs):
-                                    dest = locs[chosen - 1]
+                                if chosen and 1 <= chosen <= len(items):
+                                    dest = items[chosen - 1]
                                     with nav_voice_state_lock:
                                         nav_voice_state['mode'] = 'idle'
                                     global pending_navigation
@@ -1228,7 +1280,7 @@ def voice_command_thread():
                                         pending_navigation = dest
                                     speak(f"Navigating to {dest['name']}.")
                                 else:
-                                    speak(f"Please say a number between 1 and {len(locs)}.")
+                                    speak(f"Please say a number between 1 and {len(items)}.")
 
                         recognizer.Reset()
 
@@ -1552,6 +1604,30 @@ def api_voice_name():
         if name is not None:
             voice_name_state['name'] = None
     return jsonify({'name': name})
+
+
+@app.route('/api/voice_search', methods=['GET'])
+def api_voice_search():
+    """Frontend polls this; returns the captured Places search term once."""
+    with voice_search_lock:
+        term = voice_search_state['term']
+        if term is not None:
+            voice_search_state['term'] = None
+    return jsonify({'term': term})
+
+
+@app.route('/api/set_nav_results', methods=['POST'])
+def api_set_nav_results():
+    """Frontend POSTs Places nearby results so voice number-picking can navigate to them."""
+    data = request.get_json(force=True, silent=True) or {}
+    items = data.get('items', [])
+    # items: [{name, lat, lng, vicinity, distance}] — no 'id' field (not in SQLite)
+    with nav_voice_state_lock:
+        nav_voice_state['mode'] = 'picking'
+        nav_voice_state['type'] = 'search'
+        nav_voice_state['items'] = items[:10]
+        nav_voice_state['expires'] = time.time() + 30
+    return jsonify({'ok': True, 'count': len(items)})
 
 
 @app.route('/api/speak', methods=['POST'])

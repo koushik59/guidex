@@ -21,6 +21,9 @@ let locationsVisible = false;
 
 let savedLocations = [];              // [{id, name, lat, lng}]
 let locationMarkers = [];             // google.maps.Marker[]
+let searchResults = [];               // [{name, lat, lng, vicinity, distance}]
+let searchMarkers = [];               // google.maps.Marker[] for Places results
+let placesService = null;
 
 let activeRouteSteps = [];
 let activeStepIndex = 0;
@@ -56,7 +59,7 @@ function initMap() {
     directionsRenderer = new google.maps.DirectionsRenderer({
         map: map,
         suppressMarkers: false,
-        polylineOptions: { strokeColor: '#818cf8', strokeWeight: 5, strokeOpacity: 0.85 },
+        polylineOptions: { strokeColor: '#4f46e5', strokeWeight: 5, strokeOpacity: 0.9 },
     });
 
     autocomplete = new google.maps.places.Autocomplete(
@@ -65,6 +68,7 @@ function initMap() {
     );
 
     infoWindow = new google.maps.InfoWindow();
+    placesService = new google.maps.places.PlacesService(map);
 
     // Error banner inside map card
     const mapCard = document.getElementById('mapPanel');
@@ -98,12 +102,16 @@ function initMap() {
     const vnCancel = document.getElementById('voiceNameCancel');
     if (vnCancel) vnCancel.addEventListener('click', closeVoiceNameOverlay);
 
+    const srClose = document.getElementById('searchResultsClose');
+    if (srClose) srClose.addEventListener('click', closeSearchResults);
+
     startLocationWatch();
     loadSavedLocations();
 
     // Poll voice-triggered actions every 2 s
     setInterval(pollPendingNavigation, 2000);
     setInterval(pollSaveTrigger, 2000);
+    setInterval(pollVoiceSearch, 2000);
 }
 
 // ── Live Location ──────────────────────────────────────────────────────────────
@@ -129,10 +137,10 @@ function startLocationWatch() {
                     icon: {
                         path: google.maps.SymbolPath.CIRCLE,
                         scale: 10,
-                        fillColor: '#818cf8',
+                        fillColor: '#4f46e5',
                         fillOpacity: 1,
                         strokeColor: '#ffffff',
-                        strokeWeight: 2,
+                        strokeWeight: 3,
                     },
                     zIndex: 999,
                 });
@@ -184,14 +192,14 @@ function renderLocationMarkers() {
             title: loc.name,
             label: {
                 text: loc.name.charAt(0).toUpperCase(),
-                color: '#07091a',
+                color: '#ffffff',
                 fontSize: '11px',
                 fontWeight: 'bold',
             },
             icon: {
                 path: google.maps.SymbolPath.CIRCLE,
-                scale: 13,
-                fillColor: '#818cf8',
+                scale: 14,
+                fillColor: '#4f46e5',
                 fillOpacity: 1,
                 strokeColor: '#ffffff',
                 strokeWeight: 2,
@@ -304,46 +312,47 @@ async function deleteLocation(id) {
     }
 }
 
-// ── Navigate to saved location ─────────────────────────────────────────────────
+// ── Core navigation to explicit coordinates ────────────────────────────────────
+function navigateToCoords(lat, lng, name) {
+    if (!directionsService) return;
+    if (!userLatLng) { mapSpeak('GPS not available. Cannot start navigation.'); return; }
+
+    activeDestinationName = name;
+    document.getElementById('destinationInput').value = name;
+    closeSearchResults();   // hide search panel if open
+
+    directionsService.route(
+        {
+            origin: userLatLng,
+            destination: new google.maps.LatLng(lat, lng),
+            travelMode: google.maps.TravelMode.WALKING,
+        },
+        function (result, status) {
+            if (status === 'OK') {
+                clearMapError();
+                directionsRenderer.setDirections(result);
+                const leg = result.routes[0].legs[0];
+                activeRouteSteps = leg.steps || [];
+                activeStepIndex = 0;
+                lastGuidanceAt = 0;
+                document.getElementById('routeDestName').textContent = name;
+                document.getElementById('routeDistance').textContent = leg.distance.text;
+                document.getElementById('routeDuration').textContent = leg.duration.text;
+                document.getElementById('routeInfo').style.display = 'flex';
+                mapSpeak('Route to ' + name + '. ' + leg.distance.text + ', about ' + leg.duration.text + ' walking.');
+                setTimeout(function () { speakCurrentStep('First direction'); }, 2200);
+            } else {
+                handleDirectionsError(status);
+            }
+        }
+    );
+}
+
+// ── Navigate to saved location (looks up by id) ────────────────────────────────
 function navigateToSavedLocation(id) {
     const loc = savedLocations.find(function (l) { return l.id === id; });
-    if (!loc) return;
-    if (!userLatLng) {
-        mapSpeak('GPS not available. Cannot start navigation.');
-        return;
-    }
-    activeDestinationName = loc.name;
-    document.getElementById('destinationInput').value = loc.name;
-
-    const request = {
-        origin: userLatLng,
-        destination: new google.maps.LatLng(loc.lat, loc.lng),
-        travelMode: google.maps.TravelMode.WALKING,
-    };
-
-    directionsService.route(request, function (result, status) {
-        if (status === 'OK') {
-            clearMapError();
-            directionsRenderer.setDirections(result);
-
-            const leg = result.routes[0].legs[0];
-            activeRouteSteps = leg.steps || [];
-            activeStepIndex = 0;
-            lastGuidanceAt = 0;
-
-            document.getElementById('routeDestName').textContent = loc.name;
-            document.getElementById('routeDistance').textContent = leg.distance.text;
-            document.getElementById('routeDuration').textContent = leg.duration.text;
-            document.getElementById('routeInfo').style.display = 'flex';
-
-            const summary = 'Route to ' + loc.name + '. ' + leg.distance.text +
-                            ', about ' + leg.duration.text + ' walking.';
-            mapSpeak(summary);
-            setTimeout(function () { speakCurrentStep('First direction'); }, 2200);
-        } else {
-            handleDirectionsError(status);
-        }
-    });
+    if (!loc) { mapSpeak('Location not found.'); return; }
+    navigateToCoords(loc.lat, loc.lng, loc.name);
 }
 
 // ── Navigate to typed / autocomplete destination ───────────────────────────────
@@ -483,8 +492,15 @@ async function pollPendingNavigation() {
         const r = await fetch('/api/pending_nav');
         const d = await r.json();
         if (d.navigation) {
-            await loadSavedLocations();         // ensure list is fresh
-            navigateToSavedLocation(d.navigation.id);
+            const nav = d.navigation;
+            if (nav.id != null) {
+                // Saved location from SQLite — look up by id
+                await loadSavedLocations();
+                navigateToSavedLocation(nav.id);
+            } else {
+                // Search result — navigate directly to coords
+                navigateToCoords(nav.lat, nav.lng, nav.name);
+            }
         }
     } catch (e) { /* ignore */ }
 }
@@ -551,6 +567,135 @@ async function finishVoiceSave(name) {
     }
 }
 
+// ── Voice-triggered Nearby Search ─────────────────────────────────────────────
+async function pollVoiceSearch() {
+    try {
+        const r = await fetch('/api/voice_search');
+        const d = await r.json();
+        if (d.term) searchNearby(d.term);
+    } catch (e) { /* ignore */ }
+}
+
+function searchNearby(term) {
+    if (!placesService) { mapSpeak('Map not ready yet.'); return; }
+    if (!userLatLng)    { mapSpeak('GPS not available yet.'); return; }
+
+    // Clear previous search markers
+    searchMarkers.forEach(function (m) { m.setMap(null); });
+    searchMarkers = [];
+    searchResults = [];
+
+    placesService.nearbySearch(
+        { location: userLatLng, radius: 2000, keyword: term },
+        function (results, status) {
+            if (status !== google.maps.places.PlacesServiceStatus.OK || !results || !results.length) {
+                mapSpeak('No ' + term + ' found nearby. Try a different search.');
+                return;
+            }
+
+            searchResults = results.slice(0, 6).map(function (r) {
+                const loc = r.geometry.location;
+                const dist = Math.round(getDistanceMeters(userLatLng, loc));
+                return {
+                    name:     r.name,
+                    lat:      loc.lat(),
+                    lng:      loc.lng(),
+                    vicinity: r.vicinity || '',
+                    distance: dist,
+                    rating:   r.rating || null,
+                };
+            });
+
+            // Sort by distance
+            searchResults.sort(function (a, b) { return a.distance - b.distance; });
+
+            // Place numbered markers on the map
+            searchResults.forEach(function (res, i) {
+                const marker = new google.maps.Marker({
+                    position: { lat: res.lat, lng: res.lng },
+                    map: map,
+                    title: res.name,
+                    label: {
+                        text: String(i + 1),
+                        color: '#ffffff',
+                        fontSize: '11px',
+                        fontWeight: 'bold',
+                    },
+                    icon: {
+                        path: google.maps.SymbolPath.CIRCLE,
+                        scale: 14,
+                        fillColor: '#059669',
+                        fillOpacity: 1,
+                        strokeColor: '#ffffff',
+                        strokeWeight: 2,
+                    },
+                    zIndex: 200,
+                });
+                marker.addListener('click', function () { navigateToSearchResult(i); });
+                searchMarkers.push(marker);
+            });
+
+            // Auto-fit map to show all results + user
+            const bounds = new google.maps.LatLngBounds();
+            bounds.extend(userLatLng);
+            searchResults.forEach(function (r) { bounds.extend({ lat: r.lat, lng: r.lng }); });
+            map.fitBounds(bounds);
+
+            // Show results panel
+            renderSearchResults(term);
+
+            // Post results to backend for voice number-picking
+            fetch('/api/set_nav_results', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ items: searchResults }),
+            }).catch(function () {});
+
+            // Speak results
+            let speech = 'Found ' + searchResults.length + ' ' + term + ' nearby. ';
+            searchResults.slice(0, 5).forEach(function (res, i) {
+                speech += 'Say ' + (i + 1) + ' for ' + res.name + ', ' + res.distance + ' meters. ';
+            });
+            mapSpeak(speech);
+        }
+    );
+}
+
+function renderSearchResults(term) {
+    const panel = document.getElementById('searchResultsPanel');
+    if (!panel) return;
+    document.getElementById('searchResultsQuery').textContent =
+        term.charAt(0).toUpperCase() + term.slice(1) + ' nearby';
+    const list = document.getElementById('searchResultsList');
+    list.innerHTML = searchResults.map(function (res, i) {
+        const stars = res.rating ? ' ⭐ ' + res.rating : '';
+        return (
+            '<div class="sr-item" onclick="navigateToSearchResult(' + i + ')">' +
+            '<span class="sr-num">' + (i + 1) + '</span>' +
+            '<div class="sr-info">' +
+            '<span class="sr-name">' + escHtml(res.name) + stars + '</span>' +
+            '<span class="sr-addr">' + escHtml(res.vicinity) + '</span>' +
+            '</div>' +
+            '<span class="sr-dist">' + res.distance + 'm</span>' +
+            '</div>'
+        );
+    }).join('');
+    panel.style.display = 'flex';
+}
+
+function closeSearchResults() {
+    const panel = document.getElementById('searchResultsPanel');
+    if (panel) panel.style.display = 'none';
+    searchMarkers.forEach(function (m) { m.setMap(null); });
+    searchMarkers = [];
+}
+
+function navigateToSearchResult(index) {
+    const res = searchResults[index];
+    if (!res) return;
+    navigateToCoords(res.lat, res.lng, res.name);
+}
+
 // ── UI helpers ─────────────────────────────────────────────────────────────────
 function showMapError(html) {
     const b = document.getElementById('mapErrorBanner');
@@ -606,10 +751,12 @@ function mapSpeak(text) {
 
 // ── Public API ─────────────────────────────────────────────────────────────────
 window.guideXMaps = {
-    navigateTo:     startMapNavigation,
-    navigateToSaved: navigateToSavedLocation,
-    clearRoute:     clearRoute,
-    repeatGuidance: function () { speakCurrentStep('Current direction'); },
+    navigateTo:       startMapNavigation,
+    navigateToSaved:  navigateToSavedLocation,
+    navigateToCoords: navigateToCoords,
+    searchNearby:     searchNearby,
+    clearRoute:       clearRoute,
+    repeatGuidance:   function () { speakCurrentStep('Current direction'); },
     whereAmI: function () {
         if (userLatLng) {
             mapSpeak('Your location is latitude ' + userLatLng.lat().toFixed(4) +
@@ -624,22 +771,22 @@ window.guideXMaps = {
 
 // ── Dark Map Style ─────────────────────────────────────────────────────────────
 function darkMapStyle() {
+    // Light, clean map style matching the dashboard theme
     return [
-        { elementType: 'geometry',             stylers: [{ color: '#1a1a2e' }] },
-        { elementType: 'labels.text.stroke',   stylers: [{ color: '#1a1a2e' }] },
-        { elementType: 'labels.text.fill',     stylers: [{ color: '#a0a0b0' }] },
-        { featureType: 'road', elementType: 'geometry',             stylers: [{ color: '#16213e' }] },
-        { featureType: 'road', elementType: 'geometry.stroke',      stylers: [{ color: '#212a37' }] },
-        { featureType: 'road', elementType: 'labels.text.fill',     stylers: [{ color: '#9ca5b3' }] },
-        { featureType: 'road.highway', elementType: 'geometry',     stylers: [{ color: '#0f3460' }] },
-        { featureType: 'road.highway', elementType: 'geometry.stroke', stylers: [{ color: '#1f2835' }] },
-        { featureType: 'road.highway', elementType: 'labels.text.fill', stylers: [{ color: '#f3d19c' }] },
-        { featureType: 'water',     elementType: 'geometry',        stylers: [{ color: '#0e1626' }] },
-        { featureType: 'water',     elementType: 'labels.text.fill', stylers: [{ color: '#515c6d' }] },
-        { featureType: 'poi',       elementType: 'labels.text.fill', stylers: [{ color: '#d59563' }] },
-        { featureType: 'poi.park',  elementType: 'geometry',        stylers: [{ color: '#263c3f' }] },
-        { featureType: 'poi.park',  elementType: 'labels.text.fill', stylers: [{ color: '#6b9a76' }] },
-        { featureType: 'transit',   elementType: 'geometry',        stylers: [{ color: '#2f3948' }] },
-        { featureType: 'administrative', elementType: 'geometry.stroke', stylers: [{ color: '#4b6878' }] },
+        { featureType: 'all',  elementType: 'labels.text.fill',   stylers: [{ color: '#374151' }] },
+        { featureType: 'all',  elementType: 'labels.text.stroke',  stylers: [{ color: '#ffffff' }, { weight: 2 }] },
+        { featureType: 'road', elementType: 'geometry',            stylers: [{ color: '#ffffff' }] },
+        { featureType: 'road', elementType: 'geometry.stroke',     stylers: [{ color: '#e5e7eb' }] },
+        { featureType: 'road.highway', elementType: 'geometry',    stylers: [{ color: '#fde68a' }] },
+        { featureType: 'road.highway', elementType: 'geometry.stroke', stylers: [{ color: '#f59e0b' }] },
+        { featureType: 'water',     elementType: 'geometry',       stylers: [{ color: '#bfdbfe' }] },
+        { featureType: 'water',     elementType: 'labels.text.fill', stylers: [{ color: '#3b82f6' }] },
+        { featureType: 'landscape', elementType: 'geometry',       stylers: [{ color: '#f3f4f6' }] },
+        { featureType: 'poi',       elementType: 'geometry',       stylers: [{ color: '#e5e7eb' }] },
+        { featureType: 'poi',       elementType: 'labels.text.fill', stylers: [{ color: '#6b7280' }] },
+        { featureType: 'poi.park',  elementType: 'geometry',       stylers: [{ color: '#d1fae5' }] },
+        { featureType: 'poi.park',  elementType: 'labels.text.fill', stylers: [{ color: '#059669' }] },
+        { featureType: 'transit',   elementType: 'geometry',       stylers: [{ color: '#e0e7ff' }] },
+        { featureType: 'administrative', elementType: 'geometry.stroke', stylers: [{ color: '#d1d5db' }] },
     ];
 }

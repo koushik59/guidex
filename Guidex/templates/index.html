@@ -33,8 +33,8 @@
                         <circle cx="14" cy="14" r="3.5" fill="url(#sg)" />
                         <defs>
                             <linearGradient id="sg" x1="4" y1="6" x2="24" y2="22">
-                                <stop stop-color="#818cf8" />
-                                <stop offset="1" stop-color="#38bdf8" />
+                                <stop stop-color="#ffffff" />
+                                <stop offset="1" stop-color="#c7d2fe" />
                             </linearGradient>
                         </defs>
                     </svg>
@@ -78,17 +78,17 @@
                     <span class="nav-btn-icon">📍</span>
                     <span>My Location</span>
                 </button>
-                <button id="mapToggleBtn" class="nav-btn"
-                    style="background:rgba(99,102,241,0.15);color:#818cf8;border:1px solid rgba(99,102,241,0.3);"
+                <button id="mapToggleBtn" class="nav-btn nav-btn-voice"
                     aria-label="Toggle map visibility">
                     <span class="nav-btn-icon">🗺️</span>
                     <span>Hide Map</span>
                 </button>
 
-                <div class="sidebar-tip-box" style="margin:10px 10px 0;padding:11px 12px;background:rgba(129,140,248,0.04);border:1px solid rgba(129,140,248,0.15);border-radius:var(--r-md);font-size:0.76rem;line-height:1.5;color:var(--text-2);">
-                    <strong style="color:var(--accent);display:block;margin-bottom:4px;">Voice Navigation</strong>
-                    Say <em>"save"</em> to pin current spot.<br>
-                    Say <em>"navigate"</em> then a number to go.<br>
+                <div class="sidebar-tip-box">
+                    <strong>Voice Navigation</strong><br>
+                    Say <em>"search hotels"</em> or <em>"find hospital"</em>.<br>
+                    Say <em>"save"</em> → speak name to pin spot.<br>
+                    Say <em>"go"</em> / <em>"navigate"</em> → say number.<br>
                     Say <em>"list"</em> to hear saved places.
                 </div>
 
@@ -109,11 +109,10 @@
                     </select>
                 </div>
 
-                <div class="sidebar-tip-box" aria-hidden="true" style="margin: 12px 10px; padding: 12px; background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: var(--r-md); font-size: 0.78rem; line-height: 1.4; color: var(--text-2);">
-                    <strong style="color: var(--accent2); display: block; margin-bottom: 4px;">Keyboard Shortcuts:</strong>
-                    • Press <kbd style="background: rgba(255,255,255,0.1); padding: 1px 4px; border-radius: 3px; font-family: monospace;">T</kbd> to read/scan text.
-                    <br>
-                    • Press <kbd style="background: rgba(255,255,255,0.1); padding: 1px 4px; border-radius: 3px; font-family: monospace;">F</kbd> to recognize faces.
+                <div class="sidebar-tip-box" aria-hidden="true">
+                    <strong>Keyboard Shortcuts</strong><br>
+                    • Press <kbd>T</kbd> to scan/read text.<br>
+                    • Press <kbd>F</kbd> to recognize faces.
                 </div>
             </nav>
 
@@ -220,6 +219,16 @@
                     <div id="locationsPanel" class="locations-panel" style="display:none;">
                         <div class="locations-panel-hdr">📌 Saved Places</div>
                         <div id="locationsList" class="locations-list"></div>
+                    </div>
+
+                    <!-- Voice search results panel -->
+                    <div id="searchResultsPanel" class="srp" style="display:none;">
+                        <div class="srp-header">
+                            <span class="srp-title">🔍 <span id="searchResultsQuery"></span></span>
+                            <button id="searchResultsClose" class="srp-close" aria-label="Close search results">✕</button>
+                        </div>
+                        <div id="searchResultsList" class="srp-list"></div>
+                        <div class="srp-footer">Say a number to navigate · tap a result to navigate</div>
                     </div>
                 </div>
 
