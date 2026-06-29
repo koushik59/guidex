@@ -369,6 +369,10 @@ body {
     align-items: stretch;
 }
 
+/* ================================================================
+   NAVIGATION MAP — Google Maps + saved locations components
+   ================================================================ */
+
 /* ---------- Map Card ---------- */
 .map-card {
     background: var(--bg-card);
@@ -392,7 +396,41 @@ body {
     border-radius: 6px;
 }
 
-/* Search bar */
+/* ---------- Map Toolbar (Save / My Places) ---------- */
+.map-toolbar {
+    display: flex;
+    gap: 6px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(255,255,255,0.012);
+    flex-wrap: wrap;
+}
+
+.map-tool-btn {
+    padding: 7px 11px;
+    font-family: var(--font);
+    font-size: 0.78rem;
+    font-weight: 600;
+    border-radius: var(--r-sm);
+    cursor: pointer;
+    border: 1px solid transparent;
+    transition: all 0.18s;
+    white-space: nowrap;
+}
+.map-tool-save {
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    color: #07091a;
+}
+.map-tool-save:hover { opacity: 0.85; transform: scale(0.97); }
+
+.map-tool-places {
+    background: rgba(129,140,248,0.1);
+    color: var(--accent);
+    border-color: rgba(129,140,248,0.25);
+}
+.map-tool-places:hover { background: rgba(129,140,248,0.18); }
+
+/* ---------- Destination Search Bar ---------- */
 .map-search-bar {
     display: flex;
     gap: 8px;
@@ -435,51 +473,14 @@ body {
 }
 .map-nav-btn:hover { opacity: 0.88; transform: scale(0.98); }
 
-/* The actual Google Map iframe/div */
+/* ---------- Google Map Canvas ---------- */
 .google-map-container {
     flex: 1;
-    min-height: 280px;
+    min-height: 240px;
     background: #111827;
 }
 
-/* Route Info strip */
-.route-info {
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    padding: 10px 14px;
-    border-top: 1px solid var(--border);
-    background: rgba(129,140,248,0.04);
-    font-size: 0.82rem;
-    font-weight: 600;
-    flex-wrap: wrap;
-}
-
-.route-info-row {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    color: var(--text-2);
-}
-
-.route-icon { font-size: 1rem; }
-
-.clear-route-btn {
-    margin-left: auto;
-    padding: 5px 10px;
-    font-size: 0.75rem;
-    font-weight: 700;
-    background: rgba(251,113,133,0.1);
-    color: var(--rose);
-    border: 1px solid rgba(251,113,133,0.2);
-    border-radius: var(--r-sm);
-    cursor: pointer;
-    font-family: var(--font);
-    transition: background 0.18s;
-}
-.clear-route-btn:hover { background: rgba(251,113,133,0.18); }
-
-/* Google Places autocomplete dropdown dark theme */
+/* Google Places autocomplete dark theme */
 .pac-container {
     background: var(--bg-card) !important;
     border: 1px solid var(--border-accent) !important;
@@ -499,7 +500,251 @@ body {
     color: var(--text) !important;
 }
 .pac-item-query { color: var(--accent) !important; font-weight: 600 !important; }
-.pac-matched { color: var(--accent2) !important; }
+.pac-matched    { color: var(--accent2) !important; }
+
+/* Google Maps InfoWindow dark theme */
+.gmap-popup { min-width: 130px; }
+.gmap-popup .popup-name { font-size: 0.88rem; font-weight: 700; margin-bottom: 7px; }
+.gmap-popup .popup-btn {
+    display: block; width: 100%;
+    margin-top: 5px; padding: 6px 10px;
+    font-size: 0.78rem; font-weight: 600;
+    border-radius: var(--r-sm); cursor: pointer;
+    border: 1px solid transparent; text-align: center;
+    font-family: sans-serif;
+}
+.gmap-popup .popup-nav { background: #818cf820; color: #818cf8; border-color: #818cf840; }
+.gmap-popup .popup-del { background: #fb718520; color: #fb7185; border-color: #fb718540; }
+
+/* ---------- Route Info Strip ---------- */
+.route-info {
+    flex-direction: column;
+    gap: 0;
+    border-top: 1px solid var(--border);
+    background: rgba(129,140,248,0.04);
+    font-size: 0.82rem;
+}
+
+.route-dest {
+    display: flex; align-items: center; gap: 8px;
+    padding: 9px 14px 4px;
+    font-weight: 700; color: var(--text);
+}
+.route-dest-name { flex: 1; }
+
+.route-meta {
+    display: flex; gap: 18px;
+    padding: 0 14px 6px;
+}
+.route-info-row {
+    display: flex; align-items: center; gap: 5px;
+    color: var(--text-2); font-weight: 600;
+}
+.route-icon { font-size: 0.9rem; }
+
+.current-step-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 14px;
+    background: rgba(129,140,248,0.06);
+    border-top: 1px solid rgba(129,140,248,0.1);
+    border-bottom: 1px solid rgba(129,140,248,0.1);
+}
+.current-step-text {
+    flex: 1;
+    font-size: 0.81rem; font-weight: 600;
+    color: var(--accent);
+    line-height: 1.35;
+}
+.repeat-step-btn {
+    padding: 4px 8px; font-size: 0.82rem;
+    background: rgba(129,140,248,0.12);
+    color: var(--accent);
+    border: 1px solid rgba(129,140,248,0.25);
+    border-radius: var(--r-sm);
+    cursor: pointer; flex-shrink: 0;
+}
+.repeat-step-btn:hover { background: rgba(129,140,248,0.22); }
+
+.route-footer {
+    display: flex; align-items: center;
+    padding: 7px 14px;
+}
+.clear-route-btn {
+    margin-left: auto;
+    padding: 5px 10px;
+    font-size: 0.75rem; font-weight: 700;
+    background: rgba(251,113,133,0.1);
+    color: var(--rose);
+    border: 1px solid rgba(251,113,133,0.2);
+    border-radius: var(--r-sm);
+    cursor: pointer; font-family: var(--font);
+    transition: background 0.18s;
+}
+.clear-route-btn:hover { background: rgba(251,113,133,0.18); }
+
+/* ---------- Saved Locations Panel ---------- */
+.locations-panel {
+    flex-direction: column;
+    border-top: 1px solid var(--border);
+    max-height: 220px;
+    overflow-y: auto;
+}
+.locations-panel::-webkit-scrollbar { width: 4px; }
+.locations-panel::-webkit-scrollbar-track { background: transparent; }
+.locations-panel::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+.locations-panel-hdr {
+    padding: 9px 14px 7px;
+    font-size: 0.76rem; font-weight: 700;
+    color: var(--text-3);
+    text-transform: uppercase; letter-spacing: 0.08em;
+    border-bottom: 1px solid var(--border);
+    background: rgba(255,255,255,0.012);
+    position: sticky; top: 0; z-index: 1;
+}
+
+.locations-list { padding: 4px 0; }
+
+.loc-empty {
+    padding: 14px 16px;
+    font-size: 0.8rem; color: var(--text-3);
+    text-align: center; line-height: 1.5;
+}
+
+.loc-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 14px;
+    border-bottom: 1px solid var(--border);
+    transition: background 0.15s;
+}
+.loc-item:hover { background: var(--bg-hover); }
+.loc-item:last-child { border-bottom: none; }
+
+.loc-num {
+    width: 22px; height: 22px;
+    border-radius: 50%;
+    background: rgba(129,140,248,0.15);
+    color: var(--accent);
+    font-size: 0.72rem; font-weight: 800;
+    display: grid; place-items: center;
+    flex-shrink: 0;
+}
+.loc-info { flex: 1; min-width: 0; }
+.loc-name {
+    font-size: 0.85rem; font-weight: 600;
+    color: var(--text);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.loc-coord {
+    font-size: 0.7rem; color: var(--text-3);
+    font-family: 'Courier New', monospace;
+}
+.loc-btns { display: flex; gap: 5px; flex-shrink: 0; }
+.loc-nav-btn, .loc-del-btn {
+    width: 26px; height: 26px;
+    border-radius: var(--r-sm);
+    border: 1px solid transparent;
+    cursor: pointer; font-size: 0.85rem;
+    display: grid; place-items: center;
+    transition: all 0.15s;
+}
+.loc-nav-btn { background: rgba(129,140,248,0.12); color: var(--accent); border-color: rgba(129,140,248,0.25); }
+.loc-nav-btn:hover { background: rgba(129,140,248,0.25); }
+.loc-del-btn { background: rgba(251,113,133,0.08); color: var(--rose); border-color: rgba(251,113,133,0.2); }
+.loc-del-btn:hover { background: rgba(251,113,133,0.18); }
+
+/* ---------- Voice Name Capture Overlay ---------- */
+.vnoverlay {
+    position: fixed; inset: 0; z-index: 10000;
+    background: rgba(0,0,0,0.72);
+    backdrop-filter: blur(6px);
+    display: flex; align-items: center; justify-content: center;
+    padding: 24px;
+}
+.vnbox {
+    background: var(--bg-card);
+    border: 1px solid rgba(129,140,248,0.3);
+    border-radius: var(--r-xl);
+    padding: 36px 28px;
+    width: 100%; max-width: 360px;
+    text-align: center;
+    box-shadow: 0 24px 64px rgba(0,0,0,0.65), 0 0 0 1px rgba(129,140,248,0.1);
+}
+.vn-mic {
+    font-size: 3rem;
+    animation: vnpulse 1.4s ease-in-out infinite;
+    margin-bottom: 14px;
+    display: block;
+}
+@keyframes vnpulse {
+    0%, 100% { transform: scale(1); opacity: 1; }
+    50%       { transform: scale(1.15); opacity: 0.7; }
+}
+.vn-title { font-size: 1.15rem; font-weight: 800; color: var(--text); margin-bottom: 6px; }
+.vn-hint  { font-size: 0.83rem; color: var(--text-2); margin-bottom: 18px; line-height: 1.4; }
+.vn-name {
+    min-height: 1.8rem;
+    font-size: 1.05rem; font-weight: 700;
+    color: var(--accent);
+    background: rgba(129,140,248,0.07);
+    border-radius: var(--r-sm);
+    padding: 6px 12px;
+    margin-bottom: 20px;
+    letter-spacing: 0.02em;
+}
+.vn-cancel {
+    padding: 9px 22px;
+    font-family: var(--font); font-size: 0.84rem; font-weight: 700;
+    background: rgba(255,255,255,0.06); color: var(--text-2);
+    border: 1px solid var(--border); border-radius: var(--r-sm);
+    cursor: pointer; transition: background 0.18s;
+}
+.vn-cancel:hover { background: rgba(255,255,255,0.1); color: var(--text); }
+
+/* ---------- Save Location Dialog ---------- */
+.save-dlg-overlay {
+    position: fixed; inset: 0; z-index: 9999;
+    background: rgba(0,0,0,0.65);
+    backdrop-filter: blur(4px);
+    display: flex; align-items: center; justify-content: center;
+    padding: 20px;
+}
+.save-dlg-box {
+    background: var(--bg-card);
+    border: 1px solid var(--border-accent);
+    border-radius: var(--r-xl);
+    padding: 28px 24px;
+    width: 100%; max-width: 400px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+}
+.save-dlg-title { font-size: 1rem; font-weight: 700; color: var(--text); margin-bottom: 6px; }
+.save-dlg-coords {
+    font-size: 0.72rem; font-weight: 600;
+    color: var(--accent); font-family: 'Courier New', monospace;
+    background: rgba(129,140,248,0.08);
+    padding: 4px 8px; border-radius: 6px;
+    margin-bottom: 16px; display: inline-block;
+}
+.save-dlg-input {
+    width: 100%; padding: 11px 14px;
+    font-family: var(--font); font-size: 0.9rem; font-weight: 500;
+    background: var(--bg-card-alt); color: var(--text);
+    border: 1px solid var(--border); border-radius: var(--r-sm);
+    outline: none; margin-bottom: 18px;
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+.save-dlg-input::placeholder { color: var(--text-3); }
+.save-dlg-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(129,140,248,0.14); }
+.save-dlg-actions { display: flex; gap: 10px; }
+.save-dlg-btn {
+    flex: 1; padding: 11px;
+    font-family: var(--font); font-size: 0.88rem; font-weight: 700;
+    border-radius: var(--r-sm); cursor: pointer; border: none;
+    transition: opacity 0.18s, transform 0.15s;
+}
+.save-dlg-btn:hover { opacity: 0.88; transform: scale(0.98); }
+.save-dlg-ok { background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #07091a; }
+.save-dlg-cancel { background: rgba(255,255,255,0.06); color: var(--text-2); border: 1px solid var(--border); }
 
 /* Cards shared */
 .video-card,

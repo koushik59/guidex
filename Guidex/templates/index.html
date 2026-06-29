@@ -11,7 +11,7 @@
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap"
         rel="stylesheet">
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-    <!-- Google Maps API - Replace YOUR_API_KEY with your actual key -->
+    <!-- Google Maps API (Places + Directions). Requires internet. -->
     <script
         src="https://maps.googleapis.com/maps/api/js?key=AIzaSyDsIVIzXFVHIgnfcT0i88PCGlS9GdAm9pQ&libraries=places,directions"
         async defer></script>
@@ -74,16 +74,23 @@
                 </button>
 
                 <div class="nav-section-label">Navigation</div>
-                <button id="locateBtn" class="nav-btn nav-btn-voice" aria-label="Find my location">
+                <button id="locateBtn" class="nav-btn nav-btn-voice" aria-label="Center map on my location">
                     <span class="nav-btn-icon">📍</span>
                     <span>My Location</span>
                 </button>
                 <button id="mapToggleBtn" class="nav-btn"
                     style="background:rgba(99,102,241,0.15);color:#818cf8;border:1px solid rgba(99,102,241,0.3);"
-                    aria-label="Toggle map">
+                    aria-label="Toggle map visibility">
                     <span class="nav-btn-icon">🗺️</span>
-                    <span>Toggle Map</span>
+                    <span>Hide Map</span>
                 </button>
+
+                <div class="sidebar-tip-box" style="margin:10px 10px 0;padding:11px 12px;background:rgba(129,140,248,0.04);border:1px solid rgba(129,140,248,0.15);border-radius:var(--r-md);font-size:0.76rem;line-height:1.5;color:var(--text-2);">
+                    <strong style="color:var(--accent);display:block;margin-bottom:4px;">Voice Navigation</strong>
+                    Say <em>"save"</em> to pin current spot.<br>
+                    Say <em>"navigate"</em> then a number to go.<br>
+                    Say <em>"list"</em> to hear saved places.
+                </div>
 
                 <div class="nav-section-label">Settings</div>
                 <div class="sidebar-setting">
@@ -161,33 +168,58 @@
                     </div>
                 </div>
 
-                <!-- Google Map Panel -->
+                <!-- Google Maps Navigation Panel -->
                 <div class="map-card" id="mapPanel">
                     <div class="card-header">
                         <div class="card-title">🗺️ Navigation Map</div>
                         <div class="map-coords" id="mapCoords">Locating...</div>
                     </div>
-                    <!-- Destination search -->
-                    <div class="map-search-bar">
-                        <input id="destinationInput" type="text" placeholder="Enter destination..."
-                            aria-label="Destination address" class="map-search-input" />
-                        <button id="navigateBtn" class="map-nav-btn" aria-label="Start navigation">
-                            <span>Navigate</span> ➤
+
+                    <!-- Saved-places toolbar -->
+                    <div class="map-toolbar">
+                        <button id="saveLocationBtn" class="map-tool-btn map-tool-save" aria-label="Save current location">
+                            📍 Save Location
+                        </button>
+                        <button id="toggleLocationsBtn" class="map-tool-btn map-tool-places" aria-label="Show saved places">
+                            My Places
                         </button>
                     </div>
-                    <!-- Map container -->
+
+                    <!-- Destination search bar -->
+                    <div class="map-search-bar">
+                        <input id="destinationInput" type="text" placeholder="Enter destination..."
+                               aria-label="Destination address" class="map-search-input" />
+                        <button id="navigateBtn" class="map-nav-btn" aria-label="Start navigation">
+                            Navigate ➤
+                        </button>
+                    </div>
+
+                    <!-- Google Map canvas -->
                     <div id="googleMap" class="google-map-container" aria-label="Google Maps navigation view"></div>
-                    <!-- Route info -->
+
+                    <!-- Active route info strip -->
                     <div id="routeInfo" class="route-info" style="display:none;">
-                        <div class="route-info-row">
-                            <span class="route-icon">📏</span>
-                            <span id="routeDistance">--</span>
+                        <div class="route-dest">
+                            <span class="route-icon">🏁</span>
+                            <span id="routeDestName" class="route-dest-name">--</span>
                         </div>
-                        <div class="route-info-row">
-                            <span class="route-icon">⏱️</span>
-                            <span id="routeDuration">--</span>
+                        <div class="route-meta">
+                            <span class="route-info-row"><span class="route-icon">📏</span><span id="routeDistance">--</span></span>
+                            <span class="route-info-row"><span class="route-icon">⏱️</span><span id="routeDuration">--</span></span>
                         </div>
-                        <button id="clearRouteBtn" class="clear-route-btn">✕ Clear Route</button>
+                        <div class="current-step-row">
+                            <span id="currentStep" class="current-step-text">Loading directions...</span>
+                            <button id="repeatStepBtn" class="repeat-step-btn" aria-label="Repeat current direction">🔊</button>
+                        </div>
+                        <div class="route-footer">
+                            <button id="clearRouteBtn" class="clear-route-btn">✕ Clear Route</button>
+                        </div>
+                    </div>
+
+                    <!-- Saved locations panel (toggleable) -->
+                    <div id="locationsPanel" class="locations-panel" style="display:none;">
+                        <div class="locations-panel-hdr">📌 Saved Places</div>
+                        <div id="locationsList" class="locations-list"></div>
                     </div>
                 </div>
 
@@ -216,6 +248,32 @@
                 </div>
             </div>
         </main>
+    </div>
+
+    <!-- Voice Name Capture Overlay (shown after voice "save" command) -->
+    <div id="voiceNameOverlay" class="vnoverlay" style="display:none;" role="dialog" aria-modal="true" aria-label="Voice name capture">
+        <div class="vnbox">
+            <div class="vn-mic">🎙</div>
+            <div class="vn-title">Listening…</div>
+            <div class="vn-hint">Say the name for this location</div>
+            <div class="vn-name" id="voiceNameResult"></div>
+            <button class="vn-cancel" id="voiceNameCancel">Cancel</button>
+        </div>
+    </div>
+
+    <!-- Save Location Dialog (GUI button — manual text entry) -->
+    <div id="saveLocDialog" class="save-dlg-overlay" style="display:none;" role="dialog" aria-modal="true" aria-label="Save current location">
+        <div class="save-dlg-box">
+            <div class="save-dlg-title">📍 Save Current Location</div>
+            <div class="save-dlg-coords" id="saveLocCoords"></div>
+            <input id="saveLocName" type="text" class="save-dlg-input"
+                   placeholder="Enter a name (e.g. Home, Hospital, School...)"
+                   maxlength="40" autocomplete="off" />
+            <div class="save-dlg-actions">
+                <button id="saveDlgConfirm" class="save-dlg-btn save-dlg-ok">Save</button>
+                <button id="saveDlgCancel" class="save-dlg-btn save-dlg-cancel">Cancel</button>
+            </div>
+        </div>
     </div>
 
     <script src="{{ url_for('static', filename='script.js') }}"></script>

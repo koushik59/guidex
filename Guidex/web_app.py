@@ -15,6 +15,7 @@ import json
 import subprocess
 import tempfile
 import shutil
+import sqlite3
 
 # ------------------ Optional dependencies (fail-safe) ------------------
 # sounddevice (PortAudio) is needed for the microphone used by the Vosk voice listener.
@@ -51,6 +52,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_DIR = os.path.join(BASE_DIR, 'templates')
 STATIC_DIR = os.path.join(BASE_DIR, 'static')
 os.chdir(BASE_DIR)
+
+DATA_DIR = os.path.join(BASE_DIR, 'data')
+os.makedirs(DATA_DIR, exist_ok=True)
+LOCATIONS_DB = os.path.join(DATA_DIR, 'locations.db')
 
 print(f"[DEBUG] BASE_DIR: {BASE_DIR}")
 print(f"[DEBUG] TEMPLATE_DIR: {TEMPLATE_DIR}")
@@ -146,6 +151,16 @@ environment_mode = "outdoor"
 COOLDOWN_MAP = {"large_vehicle": 2.0, "medium_vehicle": 3.0, "small_object": 5.0}
 last_alert_times = {"large_vehicle": 0.0, "medium_vehicle": 0.0, "small_object": 0.0}
 object_track_state = {}
+
+# ---- Navigation voice state (for "navigate → one/two/three" flow) ----
+nav_voice_state_lock = threading.Lock()
+nav_voice_state = {'mode': 'idle', 'locations': [], 'expires': 0.0}
+pending_navigation = None           # set by voice thread, consumed by /api/pending_nav
+pending_navigation_lock = threading.Lock()
+save_location_triggered = False     # set by voice thread, consumed by /api/save_triggered
+save_location_lock = threading.Lock()
+voice_name_state = {'name': None}   # set by voice thread, consumed by /api/voice_name
+voice_name_lock = threading.Lock()
 
 # ------------------ Facial recognition state ------------------
 # Faces are recognized ON DEMAND (voice command "who" / the /recognize_face route),
@@ -394,6 +409,35 @@ def compute_priority(level, object_category, speed_mps, label=""):
             env_factor = 1.3
 
     return level_factor * type_factor * speed_factor * env_factor
+
+
+# ==================================================================
+# OFFLINE MAPS — SQLite location storage + tile proxy + routing
+# ==================================================================
+
+def init_locations_db():
+    conn = sqlite3.connect(LOCATIONS_DB)
+    conn.execute('''CREATE TABLE IF NOT EXISTS saved_locations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        lat REAL NOT NULL,
+        lng REAL NOT NULL,
+        icon TEXT DEFAULT 'pin',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+    conn.commit()
+    conn.close()
+    print("[MAPS] Location database ready.")
+
+
+def get_all_locations():
+    conn = sqlite3.connect(LOCATIONS_DB)
+    rows = conn.execute(
+        'SELECT id, name, lat, lng, icon, created_at FROM saved_locations ORDER BY created_at DESC'
+    ).fetchall()
+    conn.close()
+    return [{'id': r[0], 'name': r[1], 'lat': r[2], 'lng': r[3],
+             'icon': r[4], 'created_at': r[5]} for r in rows]
 
 
 def queue_alert(message):
@@ -960,13 +1004,17 @@ def command_worker():
 # Words the app understands. "[unk]" MUST stay: it is the "not a command"
 # bucket that prevents background noise being forced into a real command.
 VOICE_COMMANDS = json.dumps([
-    "scan", "read", "who", "face", "recognize", "stop", "[unk]"
+    "scan", "read", "who", "face", "recognize", "stop",
+    "save", "navigate", "go", "list", "places", "show",
+    "one", "two", "three", "four", "five",
+    "six", "seven", "eight", "nine", "ten",
+    "[unk]"
 ])
 
 # Minimum average word confidence (0..1) for a command to count.
-# Raise toward 0.8 if you still get false triggers; lower toward 0.4 if real
-# commands are being ignored.
-VOICE_MIN_CONFIDENCE = 0.6
+# Raise toward 0.7 if you get false triggers; lower toward 0.35 if real
+# commands are being ignored (multi-syllable words like "navigate" score lower).
+VOICE_MIN_CONFIDENCE = 0.45
 
 # Hard-code a device index here (e.g. 25) if auto-pick grabs the wrong mic.
 VOICE_DEVICE_INDEX = None
@@ -1019,9 +1067,12 @@ def voice_command_thread():
         print(f"[VOICE] Vosk model error: {e}")
         return
 
-    # --- THE FIX: grammar-restricted recognizer with an [unk] bucket ---
+    # Grammar-restricted recognizer — only command words get through
     recognizer = KaldiRecognizer(vosk_model, 16000, VOICE_COMMANDS)
-    recognizer.SetWords(True)   # enables per-word confidence
+    recognizer.SetWords(True)
+    # Free-form recognizer — used only while capturing a location name
+    name_recognizer = KaldiRecognizer(vosk_model, 16000)
+    name_recognizer.SetWords(True)
     audio_queue = queue.Queue()
 
     try:
@@ -1063,31 +1114,124 @@ def voice_command_thread():
         return text
 
     with stream:
-        print("[VOICE] --- MICROPHONE LIVE. Say 'scan' to read text, "
-              "'who' to recognize faces, 'stop' to stop. ---")
+        print("[VOICE] --- MICROPHONE LIVE. Say 'scan', 'who', 'save', 'navigate', 'go', 'list', 'stop' ---")
         speak("Voice system ready.")
+
+        # Name-capture mode: entered after "save" command
+        capturing_name = False
+        name_capture_timeout = 0.0
+
         while not voice_stop_event.is_set():
             try:
                 data = audio_queue.get(timeout=0.5)
-                if recognizer.AcceptWaveform(data):
-                    command = extract_command(recognizer.Result())
-                    if not command:
+
+                # ── Name capture mode ────────────────────────────────────────
+                if capturing_name:
+                    if time.time() > name_capture_timeout:
+                        # Timed out — cancel capture, reset overlay on frontend
+                        capturing_name = False
+                        global save_location_triggered
+                        with save_location_lock:
+                            save_location_triggered = False
+                        speak("Name capture timed out. Try again.")
+                        name_recognizer.Reset()
+                        recognizer.Reset()
                         continue
-                    print(f"[VOICE] Command: '{command}'")
-                    if "stop" in command:
-                        # Stop is immediate: drop anything queued and kill speech.
-                        with command_queue.mutex:
-                            command_queue.queue.clear()
-                        stop_playback()
-                    elif "read" in command or "scan" in command:
-                        # Hand off to the worker so the listener stays responsive.
-                        # Ignore repeats while a scan/face job is already running.
-                        if not command_busy.is_set():
-                            command_queue.put("scan")
-                    elif "who" in command or "recognize" in command or "face" in command:
-                        if not command_busy.is_set():
-                            command_queue.put("face")
-                    recognizer.Reset()       # clean slate for the next command
+
+                    if name_recognizer.AcceptWaveform(data):
+                        result = json.loads(name_recognizer.Result())
+                        name_text = result.get("text", "").strip()
+                        # Filter out empty / pure silence results
+                        if name_text and name_text not in ("[unk]", "the", "a"):
+                            with voice_name_lock:
+                                voice_name_state['name'] = name_text
+                            speak(f"Saving location as {name_text}.")
+                            capturing_name = False
+                            name_recognizer.Reset()
+                            recognizer.Reset()
+
+                # ── Normal command mode ──────────────────────────────────────
+                else:
+                    if recognizer.AcceptWaveform(data):
+                        command = extract_command(recognizer.Result())
+                        if not command:
+                            continue
+                        print(f"[VOICE] Command: '{command}'")
+
+                        if "stop" in command:
+                            with command_queue.mutex:
+                                command_queue.queue.clear()
+                            stop_playback()
+
+                        elif "read" in command or "scan" in command:
+                            if not command_busy.is_set():
+                                command_queue.put("scan")
+
+                        elif "who" in command or "recognize" in command or "face" in command:
+                            if not command_busy.is_set():
+                                command_queue.put("face")
+
+                        elif "save" in command:
+                            with save_location_lock:
+                                save_location_triggered = True
+                            speak("Say the name for this location.")
+                            capturing_name = True
+                            name_capture_timeout = time.time() + 12.0
+                            # Drain any stale audio before listening for the name
+                            while not audio_queue.empty():
+                                try: audio_queue.get_nowait()
+                                except Exception: break
+                            name_recognizer.Reset()
+
+                        elif "list" in command or "places" in command or "show" in command:
+                            locs = get_all_locations()
+                            if not locs:
+                                speak("You have no saved locations yet.")
+                            else:
+                                parts = [f"{i + 1}: {l['name']}" for i, l in enumerate(locs[:8])]
+                                speak("Your saved locations are: " + ", ".join(parts) + ".")
+
+                        elif "navigate" in command or "go" in command:
+                            locs = get_all_locations()
+                            if not locs:
+                                speak("You have no saved locations. Save a location first.")
+                            else:
+                                with nav_voice_state_lock:
+                                    nav_voice_state['mode'] = 'picking'
+                                    nav_voice_state['locations'] = locs[:10]
+                                    nav_voice_state['expires'] = time.time() + 20
+                                parts = [f"{i + 1} for {l['name']}" for i, l in enumerate(locs[:5])]
+                                speak("Say the number of your destination. " + ", ".join(parts) + ".")
+
+                        elif any(n in command for n in
+                                 ["one", "two", "three", "four", "five",
+                                  "six", "seven", "eight", "nine", "ten"]):
+                            with nav_voice_state_lock:
+                                mode = nav_voice_state['mode']
+                                locs = list(nav_voice_state['locations'])
+                                expires = nav_voice_state['expires']
+                            if mode == 'picking' and time.time() < expires:
+                                num_map = {"one": 1, "two": 2, "three": 3, "four": 4,
+                                           "five": 5, "six": 6, "seven": 7, "eight": 8,
+                                           "nine": 9, "ten": 10}
+                                chosen = None
+                                for word, num in num_map.items():
+                                    if word in command:
+                                        chosen = num
+                                        break
+                                if chosen and 1 <= chosen <= len(locs):
+                                    dest = locs[chosen - 1]
+                                    with nav_voice_state_lock:
+                                        nav_voice_state['mode'] = 'idle'
+                                    global pending_navigation
+                                    with pending_navigation_lock:
+                                        pending_navigation = dest
+                                    speak(f"Navigating to {dest['name']}.")
+                                else:
+                                    speak(f"Please say a number between 1 and {len(locs)}.")
+
+                        recognizer.Reset()
+
             except queue.Empty:
                 continue
             except Exception as e:
@@ -1328,6 +1472,98 @@ def latest_face_route():
         })
 
 
+# ==================================================================
+# OFFLINE MAPS API
+# ==================================================================
+
+@app.route('/api/locations', methods=['GET'])
+def api_get_locations():
+    return jsonify(get_all_locations())
+
+
+@app.route('/api/locations', methods=['POST'])
+def api_save_location():
+    data = request.get_json(force=True, silent=True) or {}
+    name = (data.get('name') or '').strip()
+    lat = data.get('lat')
+    lng = data.get('lng')
+    icon = data.get('icon', 'pin')
+    if not name or lat is None or lng is None:
+        return jsonify({'error': 'name, lat, and lng are required'}), 400
+    conn = sqlite3.connect(LOCATIONS_DB)
+    cur = conn.execute(
+        'INSERT INTO saved_locations (name, lat, lng, icon) VALUES (?, ?, ?, ?)',
+        (name, float(lat), float(lng), icon)
+    )
+    conn.commit()
+    loc_id = cur.lastrowid
+    conn.close()
+    speak(f"Location {name} saved.")
+    return jsonify({'id': loc_id, 'name': name, 'lat': lat, 'lng': lng}), 201
+
+
+@app.route('/api/locations/<int:loc_id>', methods=['DELETE'])
+def api_delete_location(loc_id):
+    conn = sqlite3.connect(LOCATIONS_DB)
+    conn.execute('DELETE FROM saved_locations WHERE id = ?', (loc_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
+
+
+@app.route('/api/locations/<int:loc_id>', methods=['PUT'])
+def api_update_location(loc_id):
+    data = request.get_json(force=True, silent=True) or {}
+    name = (data.get('name') or '').strip()
+    if not name:
+        return jsonify({'error': 'name is required'}), 400
+    conn = sqlite3.connect(LOCATIONS_DB)
+    conn.execute('UPDATE saved_locations SET name = ? WHERE id = ?', (name, loc_id))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
+
+
+@app.route('/api/pending_nav', methods=['GET'])
+def api_pending_nav():
+    """Frontend polls this; returns a location object when voice nav was triggered."""
+    global pending_navigation
+    with pending_navigation_lock:
+        nav = pending_navigation
+        pending_navigation = None
+    return jsonify({'navigation': nav})
+
+
+@app.route('/api/save_triggered', methods=['GET'])
+def api_save_triggered():
+    """Frontend polls this; returns True once when voice 'save' command fires."""
+    global save_location_triggered
+    with save_location_lock:
+        triggered = save_location_triggered
+        save_location_triggered = False
+    return jsonify({'triggered': triggered})
+
+
+@app.route('/api/voice_name', methods=['GET'])
+def api_voice_name():
+    """Frontend polls this after voice 'save'; returns the captured location name."""
+    with voice_name_lock:
+        name = voice_name_state['name']
+        if name is not None:
+            voice_name_state['name'] = None
+    return jsonify({'name': name})
+
+
+@app.route('/api/speak', methods=['POST'])
+def api_speak():
+    """Frontend triggers backend espeak for navigation announcements."""
+    data = request.get_json(force=True, silent=True) or {}
+    text = (data.get('text') or '').strip()
+    if text:
+        speak(text)
+    return jsonify({'ok': True})
+
+
 @app.route('/stop_speech', methods=['POST', 'GET'])
 def stop_speech_route():
     """Stop any ongoing speech. Call this from the Navigation button."""
@@ -1388,6 +1624,9 @@ threading.Thread(target=tts_worker, daemon=True).start()
 command_worker_thread = threading.Thread(target=command_worker, daemon=True)
 command_worker_thread.start()
 
+# Initialize saved-locations database.
+init_locations_db()
+
 # Load enrolled faces once at startup (safe no-op if the library is missing).
 if FACE_RECOGNITION_AVAILABLE:
     load_known_faces()
@@ -1403,6 +1642,6 @@ else:
 
 if __name__ == '__main__':
     try:
-        app.run(host='127.0.0.1', port=5000)
+        app.run(host='127.0.0.1', port=5002)
     finally:
         cleanup()
